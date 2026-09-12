@@ -8,6 +8,7 @@ import time
 import numpy as np
 
 from .config import SAMPLE_RATE, _env_get
+from .log import log_event
 
 # ---------- 凭证 / ISI token（照 voice-bridge） ----------
 ISI_WS_URL = "wss://nls-gateway.cn-shanghai.aliyuncs.com/ws/v1"
@@ -180,12 +181,17 @@ def transcribe(audio, timeout=60):
             return isi_transcribe(audio, appkey, ak_id, ak_secret, timeout=timeout)
         except Exception as e:
             print(f"⚠️ ISI 转写失败: {e}", flush=True)
+            # 静默启动无控制台：提供方失败原因必须落盘，否则「转写全失败」无法定位
+            log_event({"type": "asr_provider_fail", "provider": "isi",
+                       "err": f"{type(e).__name__}: {e}"[:200]})
     key = _env_get("DASHSCOPE_API_KEY")
     if key:
         try:
             return cloud_transcribe(audio, key, timeout=timeout)
         except Exception as e:
             print(f"⚠️ DashScope 转写失败: {e}", flush=True)
+            log_event({"type": "asr_provider_fail", "provider": "dashscope",
+                       "err": f"{type(e).__name__}: {e}"[:200]})
     raise RuntimeError("云端转写全失败（检查 .env 凭证）")
 
 # ---------- 转写清洗 + 攒句（照 voice-bridge） ----------

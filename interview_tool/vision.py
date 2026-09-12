@@ -127,7 +127,9 @@ def _ask_vision_multi(key, model, url, parts, prompt, max_tokens):
              "image_url": {"url": f"data:image/jpeg;base64,{b}"}} for b in b64s]
     body = {"model": model, "messages": [{"role": "user",
             "content": imgs + [{"type": "text", "text": prompt}]}], "max_tokens": max_tokens}
-    r = requests.post(url, headers=hdr, json=body, timeout=60)
+    # 超时 (15, 120)：多轮记忆大请求 + 新模型首 token 慢，60s 单值实测被
+    # HTTPConnectionPool 超时打爆（2026-09-12 用户高频复现）——对齐 chat.py 写法
+    r = requests.post(url, headers=hdr, json=body, timeout=(15, 120))
     if r.status_code == 200:
         return _vision_parse(r.json()), 200
     if r.status_code in (400, 404):                 # chat 格式/模型入口被拒 → 回退 responses 格式
@@ -135,7 +137,7 @@ def _ask_vision_multi(key, model, url, parts, prompt, max_tokens):
             [{"type": "input_image",
               "image_url": f"data:image/jpeg;base64,{b}"} for b in b64s] +
             [{"type": "input_text", "text": prompt}]}]}
-        r2 = requests.post(VISION_FALLBACK_URL, headers=hdr, json=body2, timeout=60)
+        r2 = requests.post(VISION_FALLBACK_URL, headers=hdr, json=body2, timeout=(15, 120))
         if r2.status_code == 200:
             return _vision_parse(r2.json()), 200
         return None, r2.status_code
@@ -144,6 +146,19 @@ def _ask_vision_multi(key, model, url, parts, prompt, max_tokens):
 def _ask_vision_once(key, model, url, img, prompt, max_tokens):
     """单张 PIL 图入口（保留旧签名兼容）→ 走多图核心"""
     return _ask_vision_multi(key, model, url, [img], prompt, max_tokens)
+
+def _ask_vision_retry(key, model, url, parts, prompt, max_tokens):
+    """识图带一次自动重试：HTTPConnectionPool 超时（大图+多轮记忆请求重、模型端
+    慢/不稳）是「识图异常」最常见根因，重试一次多半能成；重试仍超时再抛给上层"""
+    import requests
+    for attempt in (1, 2):
+        try:
+            return _ask_vision_multi(key, model, url, parts, prompt, max_tokens)
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+            if attempt == 2:
+                raise
+            log_event({"type": "vision_retry", "why": type(e).__name__,
+                       "err": str(e)[:120]})
 
 def _vision_providers():
     """[2026-09-09 冗余模型选择] 主+备用视觉模型拨号组：主失败自动切备用。
@@ -176,6 +191,7 @@ def do_vision(ui):
         providers = _vision_providers()         # 主+备用拨号组（备用未配则只有主，行为同旧版）
         from PIL import Image, ImageGrab
         import time as _time
+        t0 = _time.time()
         ui("ov_ctl", "hide")                        # 置顶窗先离场：它会被截进图，模型看见「Alt+P截」等字样拒答
         try:
             _time.sleep(0.35)                       # 等 Tk 主线程 withdraw + 合成一帧
@@ -196,7 +212,7 @@ def do_vision(ui):
         for tag, pkey, pmodel, purl in providers:
             if tag == "backup":                 # [2026-09-09] 主链路两枪都空才轮询到备用：提示切换
                 ui("status", "🔁 主视觉模型没答出，自动切换备用模型重看中…")
-            ans, st = _ask_vision_multi(pkey, pmodel, purl, parts, prompt,
+            ans, st = _ask_vision_retry(pkey, pmodel, purl, parts, prompt,
                                         profiles.ACTIVE.vision_max_tokens)
             if ans:
                 if tag == "backup":             # 备用整图直接答出：答案带前缀，用户可感知救场
@@ -205,7 +221,7 @@ def do_vision(ui):
                 break
             ui("status", "🔍 整图没认出，放大题目重看中…")
             zoom = _crop_center_zoom(img)
-            ans2, st2 = _ask_vision_multi(pkey, pmodel, purl, _vis_mem_parts() + [zoom],
+            ans2, st2 = _ask_vision_retry(pkey, pmodel, purl, _vis_mem_parts() + [zoom],
                                           prompt, profiles.ACTIVE.vision_max_tokens)
             if ans2:
                 ans = f"（整图没答出，放大重看）\n{ans2}"
@@ -222,8 +238,11 @@ def do_vision(ui):
                    "err": None if (ans and not ans.startswith("❌")) else (ans or "")[:200],
                    "answer": ans[:2000], "ans_len": len(ans or ""),
                    "truncated": bool(ans) and len(ans) > 2000,
-                   "mem_imgs": mem_n, "mem_ans": len(VIS_MEM["ans"])})
+                   "mem_imgs": mem_n, "mem_ans": len(VIS_MEM["ans"]),
+                   "api_sec": round(_time.time() - t0, 2)})
     except Exception as e:
+        # 2026-09-12 起落盘：原只弹状态栏，静默启动下「识图失败」在日志里零痕迹
+        log_event({"type": "vision_error", "err": f"{type(e).__name__}: {e}"[:200]})
         ui("status", f"❌ 识图异常: {e}")
     finally:
         VISION_STATE["busy"] = False
