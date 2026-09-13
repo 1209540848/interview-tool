@@ -66,10 +66,24 @@ def get_isi_token(ak_id, ak_secret):
         _isi_token_cache["expire"] = now + ((result["Token"].get("ExpireTime") or now + 86400) - now)
         return tok
 
+async def _connect_with_fallback(url, kw1, kw2):
+    """websockets 头部参数名历史漂移（≤13 additional_headers → 14/15 extra_headers
+    → 16+ 改回 additional_headers）：错名会被 connect 的 **kwargs 吞掉、转发给
+    loop.create_connection → TypeError（2026-09-13 用户报错根因，环境 17.1）。
+    运行时试错兜底，任何版本都能连上"""
+    import websockets
+    try:
+        return await websockets.connect(url, **kw1)
+    except TypeError:
+        return await websockets.connect(url, **kw2)
+
+def _ws_connect(url, headers, **kwargs):
+    return _connect_with_fallback(url, dict(additional_headers=headers, **kwargs),
+                                  dict(extra_headers=headers, **kwargs))
+
 def isi_transcribe(audio, appkey, ak_id, ak_secret, timeout=60):
     """ISI 实时识别（照 voice-bridge：等 TranscriptionStarted 再发音频，16000B/块）"""
     import asyncio
-    import websockets
     import uuid
     pcm = (np.clip(audio, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
     token = get_isi_token(ak_id, ak_secret)
@@ -77,8 +91,8 @@ def isi_transcribe(audio, appkey, ak_id, ak_secret, timeout=60):
     async def _run():
         sentences, final = [], ""
         headers = {"X-NLS-Token": token}
-        async with websockets.connect(ISI_WS_URL, extra_headers=headers,   # websockets>=12 改叫 extra_headers
-                                      max_size=4 * 1024 * 1024) as ws:
+        ws = await _ws_connect(ISI_WS_URL, headers, max_size=4 * 1024 * 1024)
+        async with ws:
             start = {
                 "header": {"message_id": uuid.uuid4().hex, "task_id": uuid.uuid4().hex,
                            "namespace": "SpeechTranscriber", "name": "StartTranscription",
@@ -134,8 +148,8 @@ def cloud_transcribe(audio, api_key, timeout=60):
     async def _run():
         sentences, final = [], ""
         headers = {"Authorization": f"bearer {api_key}"}
-        async with websockets.connect(DASHSCOPE_WS_URL, additional_headers=headers,
-                                      max_size=4 * 1024 * 1024) as ws:
+        ws = await _ws_connect(DASHSCOPE_WS_URL, headers, max_size=4 * 1024 * 1024)
+        async with ws:
             await ws.send(json.dumps({
                 "header": {"action": "run-task", "task_id": task_id, "streaming": "duplex"},
                 "payload": {"task_group": "audio", "task": "asr",

@@ -12,5 +12,6 @@
   "def:_type_prep": [1496, 1506, 1507],
   "def:_ask_vision_multi": [1821, 1824, 1829],
   "def:_env_get": [156, 159],
-  "def:isi_transcribe": [212]
+  "def:isi_transcribe": [212, 219, 220, 227],
+  "def:cloud_transcribe": [270, 271]
 }
