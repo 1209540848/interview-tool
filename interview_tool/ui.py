@@ -149,6 +149,21 @@ def show_answer_window(ui_q):
     root.bind("<ButtonPress-1>", on_press)
     root.bind("<B1-Motion>", on_move)
 
+    a_text = tk.Text(root, bg=BG_DARK, fg="#D4D4D4", wrap="word",
+                     font=(FAM, -14), relief="flat", padx=10, pady=8,
+                     cursor="arrow", insertwidth=0)      # 无光标闪烁、指针正常
+    # 底部小字：对话索引 + 模式（低调灰，不抢眼）
+    status = tk.Label(root, text="", bg=BG_DARK, fg="#7a7a7a",
+                      font=(FAM, -10), anchor="w")
+    status.pack(fill="x", side="bottom", padx=10, pady=(0, 6))
+    # 你的回答转写显示行（自动模式：门控录到你的话 → 小字灰显示，供确认录到了什么）
+    my_label = tk.Label(root, text="", bg=BG_DARK, fg="#9a9a9a",
+                        font=(FAM, -10), anchor="w", wraplength=540)
+    my_label.pack(fill="x", side="bottom", padx=10, pady=(0, 2))
+    a_text.pack(fill="both", expand=True)
+    # 血泪教训(2026-09-13)：✕ 与缩放柄必须最后创建——Tk 堆叠顺序=创建顺序，先建
+    # 会被 a_text/status/my_label 压在底下：角落点击落到上层部件、冒泡成整窗拖拽，
+    # 缩放柄失效（「没法手动调整窗口大小」根因）。故整块挪到 pack 之后
     # 右上角小关闭按钮（✕ 悬停变红；点击退出进程，返回 "break" 阻止拖拽绑定冒泡）
     close_btn = tk.Label(root, text="✕", bg=BG_DARK, fg="#D4D4D4",
                          font=(FAM, -12), cursor="hand2")
@@ -163,19 +178,6 @@ def show_answer_window(ui_q):
 
     # 右下角缩放柄（code 独有；quiz 无手柄）——原文在 profiles.mount_window_extra
     profiles.ACTIVE.mount_window_extra(root, FAM, BG_DARK)
-
-    a_text = tk.Text(root, bg=BG_DARK, fg="#D4D4D4", wrap="word",
-                     font=(FAM, -14), relief="flat", padx=10, pady=8,
-                     cursor="arrow", insertwidth=0)      # 无光标闪烁、指针正常
-    # 底部小字：对话索引 + 模式（低调灰，不抢眼）
-    status = tk.Label(root, text="", bg=BG_DARK, fg="#7a7a7a",
-                      font=(FAM, -10), anchor="w")
-    status.pack(fill="x", side="bottom", padx=10, pady=(0, 6))
-    # 你的回答转写显示行（自动模式：门控录到你的话 → 小字灰显示，供确认录到了什么）
-    my_label = tk.Label(root, text="", bg=BG_DARK, fg="#9a9a9a",
-                        font=(FAM, -10), anchor="w", wraplength=540)
-    my_label.pack(fill="x", side="bottom", padx=10, pady=(0, 2))
-    a_text.pack(fill="both", expand=True)
     # 文字 tag：状态行按阶段着色、提问/回答标题区分
     a_text.tag_configure("st_rec", foreground="#ffcc66")    # 录音中黄
     a_text.tag_configure("st_work", foreground="#7fb3ff")   # 转写/生成蓝

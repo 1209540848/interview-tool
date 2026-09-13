@@ -625,10 +625,15 @@ def main(profile):
                 k2 = key_down(0x32)                         # VK_2
                 alt = key_down(VK_ALT)
                 altp = alt and pkey
-                if altp and not hk["altp"] and not VISION_STATE["busy"]:
-                    VISION_STATE["busy"] = True
-                    set_status("💻 笔试识图中…（同题续截自动带上下文）")
-                    threading.Thread(target=do_vision, args=(ui,), daemon=True).start()
+                if altp and not hk["altp"]:
+                    if VISION_STATE["busy"]:
+                        # 上一张还在识别中：连按 Alt+P 曾静默吞掉（无日志无提示，像「识图失败」）
+                        log_event({"type": "altp_ignored", "why": "vision_busy"})
+                        set_status("⏳ 上一张还在识别中，稍候…")
+                    else:
+                        VISION_STATE["busy"] = True
+                        set_status("💻 笔试识图中…（同题续截自动带上下文）")
+                        threading.Thread(target=do_vision, args=(ui,), daemon=True).start()
                 hk["altp"] = altp
                 # Alt+1：把最新识图答案模拟真人打字打进当前焦点输入框（再按 Alt+1 = 停止）。
                 # 只在有答案待打时生效——平时 1 键不劫持，答题框里正常输 1
@@ -645,7 +650,7 @@ def main(profile):
                                        "why": "typing刚启动1秒内，忽略第二次按"})
                     elif TYPING_STATE["armed"] and TYPING_STATE["text"]:
                         TYPING_STATE["armed"] = False
-                        print("⌨️ 自动输入开始…（松开 Alt 后自动打；再按 Alt+1 停止）", flush=True)
+                        print("⌨️ 自动输入开始…（松开 Alt 后自动打；框架已有行自动跳过，光标放函数体内；再按 Alt+1 停止）", flush=True)
                         threading.Thread(target=_after_alt_release,
                                          args=(type_answer_into_foreground,
                                                TYPING_STATE["text"]), daemon=True).start()

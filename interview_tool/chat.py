@@ -26,7 +26,7 @@ def build_system_prompt():
             sp += (f"\n\n以下是用户的简历，回答时结合简历给出贴合个人经历的答案要点"
                    f"（不要复述简历本身）：\n{resume[:RESUME_MAX_CHARS]}")
     except OSError:
-        print("⚠️ resume.md 不存在（简历注入跳过，可在 voice-interview/resume.md 放简历）",
+        print("⚠️ resume.md 不存在（简历注入跳过，可在工具根目录放 resume.md）",
               flush=True)
     return sp
 
