@@ -91,8 +91,14 @@ def _vision_parse(j):
         return None                                 # 纯思考流（deepseek-v4 实测）→ 当没答案，交给上层报清晰错误
     except Exception:
         try:                                        # responses 格式（火山新接口）
-            out = j["output"]
-            return "".join(c.get("text", "") for c in out[0]["content"] if isinstance(c, dict))
+            texts = []
+            for o in j.get("output", []):
+                if not isinstance(o, dict) or o.get("type") == "reasoning":
+                    continue        # seed-2.1 推理块排在 output[0]：思考过程不是答案，跳过
+                for c in o.get("content", []):
+                    if isinstance(c, dict):
+                        texts.append(c.get("text", ""))
+            return "".join(texts)
         except Exception:
             return None
 

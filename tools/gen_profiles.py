@@ -9,7 +9,7 @@ profiles.py 收容"共享主本内无法收敛"的全部场景差异（quiz 测�
       经字符串折叠（Constant 直取 / JoinedStr 全常量拼接 / + 链递归）取文本
   * 窗口差异方法（源码行切片嵌入，替换点登记在案）：
       place_window        —— 窗口初始几何（quiz 560x160 顶中 / code 恢复上次或 760x460）
-      mount_window_extra  —— code 缩放手柄原文；quiz 空实现（原版无手柄）
+      mount_window_extra  —— code 缩放手柄原文（2026-09-13 起 quiz 共用同一份）
 
 安全：切片/提取前校验锚点文本，源文件漂移即中止 → 生成器可放心重跑。
 用法：python tools/gen_profiles.py
@@ -187,11 +187,11 @@ class Profile:
         raise NotImplementedError                # QuizProfile 空实现 / CodeProfile 手柄
 
 
-{cls_body("QuizProfile", "quiz 测评版：560x160 小窗顶中，选择题答案一屏足够",
+{cls_body("QuizProfile", "quiz 测评版：560x160 小窗顶中，右下角可拉大看长答案",
           "quiz 版：水平居中、垂直顶边贴屏幕最上（用户要求）；之后可正常拖动",
           body_place_q,
-          "quiz 版窗口无缩放手柄（560x160 固定小窗），空实现",
-          ["pass                        # 原版无此段（code 独有缩放手柄）"])}
+          "quiz 版：右下角缩放柄与 code 版共用（2026-09-13 起：长答案也要拉大窗口看）",
+          body_mount_c)}
 {cls_body("CodeProfile", "code 笔试版：恢复上次窗口或 760x460 大窗，带右下角缩放手柄",
           "code 版：重启回到上次的尺寸+位置（560x160 代码根本排不下）；无记录则 760x460 默认放大",
           body_place_c,

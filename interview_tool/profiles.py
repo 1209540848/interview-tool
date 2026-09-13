@@ -36,7 +36,7 @@ class Profile:
 
 
 class QuizProfile(Profile):
-    """quiz 测评版：560x160 小窗顶中，选择题答案一屏足够"""
+    """quiz 测评版：560x160 小窗顶中，右下角可拉大看长答案"""
 
     def place_window(self, root, load_window_geometry):
         """quiz 版：水平居中、垂直顶边贴屏幕最上（用户要求）；之后可正常拖动"""
@@ -45,8 +45,27 @@ class QuizProfile(Profile):
         root.geometry(f"560x160+{(_sw - 560) // 2}+0")
 
     def mount_window_extra(self, root, fam, bg):
-        """quiz 版窗口无缩放手柄（560x160 固定小窗），空实现"""
-        pass                        # 原版无此段（code 独有缩放手柄）
+        """quiz 版：右下角缩放柄与 code 版共用（2026-09-13 起：长答案也要拉大窗口看）"""
+        import tkinter as tk   # 局部 import：与旧 show_answer_window 同款
+        # 右下角缩放柄：无边框窗没有系统缩放手柄，长代码答案拉大窗口看（最小 300x160）。
+        # 返回 "break" 阻断冒泡到 root 的拖拽绑定（同 close_btn 的防打架手法）
+        grip = tk.Label(root, text="⣿", bg=bg, fg="#7a7a7a",
+                        cursor="size_nw_se", font=(fam, -10))
+        grip.place(relx=1.0, x=-14, rely=1.0, y=-15)
+        def on_grip_press(e):
+            root._grip0 = (e.x_root, e.y_root)
+            root._grip_geo = root.geometry()
+        def on_grip_move(e):
+            try:
+                wh, xy = root._grip_geo.split("+")[0], root._grip_geo.split("+")[1:]
+                gw, gh = int(wh.split("x")[0]), int(wh.split("x")[1])
+                gw = max(300, gw + (e.x_root - root._grip0[0]))
+                gh = max(160, gh + (e.y_root - root._grip0[1]))
+                root.geometry(f"{gw}x{gh}+{xy[0]}+{xy[1]}")
+            except Exception:
+                pass
+        grip.bind("<ButtonPress-1>", lambda e: (on_grip_press(e), "break")[1])
+        grip.bind("<B1-Motion>", lambda e: (on_grip_move(e), "break")[1])
 
 class CodeProfile(Profile):
     """code 笔试版：恢复上次窗口或 760x460 大窗，带右下角缩放手柄"""
