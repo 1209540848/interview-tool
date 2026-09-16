@@ -11,6 +11,7 @@ GEO_FILE 收敛：原 dirname(abspath(__file__)) 包化后指向包内目录 →
 import json
 import os
 import queue
+import time
 
 from . import profiles          # 窗口差异方法经 ACTIVE 调（差异文本唯一副本在 profiles）
 from .config import BASE_DIR, LOG_DIR
@@ -190,20 +191,65 @@ def show_answer_window(ui_q):
                          background="#15181E", lmargin1=10, lmargin2=10,
                          rmargin=10, spacing1=4, spacing3=4)
 
+    # ---------- 视图跟随策略（流式可读性的关键） ----------
+    # follow=True：新内容到达滚到尾部（打字机）；False：用户手动滚上去过 → 锁住他的位置。
+    # 贴底自动恢复跟随（滚回底部就是要看最新）；滚轮是唯一手动滚动入口（无边框窗焦点常
+    # 不在文字区，键盘滚动基本不触发），所以只需在滚轮回调里重判。
+    SCROLL = {"follow": True}
+    A_WATCH = {"ts": 0.0}        # 最后一次流式帧时刻：静默兜底判定"其实已生成完"用
+    SILENT_DONE_SEC = 2.0        # 末帧后静默多久算生成结束（只兜底真答案以省略号结尾的罕见情况）
+
+    def _view_top_line():
+        """视图顶部行号（重绘前存、重绘后恢复）：行号在流式增长时稳定，恢复精确"""
+        try:
+            return int(a_text.index("@0,0").split(".")[0])
+        except Exception:
+            return 1
+
+    def _sync_follow():
+        """滚轮/拖动后重判跟随态：贴底 → 恢复跟随，否则锁定"""
+        try:
+            SCROLL["follow"] = a_text.yview()[1] >= 0.999
+        except Exception:
+            pass
+
     def insert_md(tx, text):
         """答案文本插入文字区：把 ```代码围栏``` 渲染成等宽+深底块（见上 code tag），
-        其余原样。此前围栏符原样上屏、代码用非等宽正文显示，缩进对不齐糊成一片"""
+        其余原样。此前围栏符原样上屏、代码用非等宽正文显示，缩进对不齐糊成一片。
+
+        流式未闭合容忍：生成中代码块的闭围栏还没到（只有开围栏）时，旧正则配不上对
+        → 围栏行和代码原文裸上屏，等闭围栏到了才"啪"地跳变成块（code 笔试全程可见）。
+        现在把「行首开围栏 → 文末」这段直接按代码块渲染并吞掉围栏行：全程无裸露，
+        闭围栏到达后走正常配对分支，两条路径渲染结果逐字一致（都 rstrip 掉尾部空行）。"""
         import re as _re
         pos = 0
         for m in _re.finditer(r"```[^\n`]*\n(.*?)```", text, _re.S):
             tx.insert("end", text[pos:m.start()], None)         # 围栏前普通文本
             tx.insert("end", m.group(1).rstrip("\n"), "code")   # 块内：吞围栏行，等宽渲染
             pos = m.end()
-        tx.insert("end", text[pos:], None)
+        rest = text[pos:]
+        m_open = _re.search(r"```[^\n`]*\n", rest)              # 未闭合的开围栏行（含换行才算）
+        if m_open:
+            tx.insert("end", rest[:m_open.start()], None)
+            tx.insert("end", rest[m_open.end():].rstrip("\n"), "code")
+        else:
+            tx.insert("end", rest, None)
 
-    def render():
-        """按历史索引 + 阶段重绘文字区（提问和回答同屏）"""
+    def render(anchor="keep"):
+        """按历史索引 + 阶段重绘文字区（提问和回答同屏）。
+
+        anchor 决定重绘后视图停哪（原实现无条件 see("1.0")，流式时每帧都被拽回顶部，
+        答案一超一屏就永远看不到正在生成的尾部——这里是「流式看着像卡住」的真根因）：
+          "tail" → 滚到底部，跟住正在生成的答案尾部（打字机效果）
+          "top"  → 滚回顶部，从提问读起（新问题 / 翻历史）
+          "keep" → 原位不动（阶段提示这类无关重绘，不打扰正在读的位置）
+        anchor="tail" 在用户手动滚上去过（follow=False）时自动降级为 "keep"：
+        否则用户往回翻的每一帧都会被拽回底部，等于不让读。"""
         global cur
+        _anchor = "keep" if (anchor == "tail" and not SCROLL["follow"]) else anchor
+        if _anchor == "top":
+            SCROLL["follow"] = True          # 回顶部 = 回到跟随态（否则后续流式停在锁定位不跟）
+        _top = _view_top_line() if _anchor == "keep" else 1
         a_text.delete("1.0", "end")
         st = VIEW["stage"]
         if st == "rec":
@@ -223,7 +269,17 @@ def show_answer_window(ui_q):
             insert_md(a_text, item["q"] + "\n\n")
             a_text.insert("end", "💡 回答：\n", "a_tag")
             insert_md(a_text, (item["a"] or "（生成中…）") + "\n")
-        a_text.see("1.0")
+        if _anchor == "tail":
+            a_text.see("end")
+        elif _anchor == "top":
+            a_text.yview_moveto(0.0)
+        else:
+            # 行号复位：流式期间前文（提问 + 已生成的答案）不变、行号稳定，
+            # 按行号恢复比重绘前记 yview 比例精确（比例会随总行数增长而漂移）
+            try:
+                a_text.yview(f"{_top}.0")
+            except Exception:
+                pass
         n = len(hist)
         pos = f"对话 {min(idx + 1, max(n, 1))}/{n}" if n else "对话 0/0"
         status.config(text=f"{pos} · {MODE_TXT}{PENDING_TXT}")
@@ -236,12 +292,13 @@ def show_answer_window(ui_q):
         if cur < 0:
             cur = len(hist) - 1
         cur = max(0, min(cur + delta, len(hist) - 1))
-        render()
+        render("top")            # 翻到的历史条目：从提问读起
     # 滚轮滚动：Text 默认不响应鼠标滚轮，必须绑定（答案很长时滚着看）。
     # Windows 的 <MouseWheel> 发给有焦点的控件——无边框窗焦点常不在文字区（用户没点过
     # 文字区时滚轮永远不触发），所以 bind_all 整窗响应（提词器/迷你条共用同一个 a_text）
     def on_wheel(event):
         a_text.yview_scroll(int(-event.delta / 120), "units")
+        _sync_follow()      # 滚上去 → 锁定位置（流式不再拽回）；滚回底部 → 恢复跟随
     root.bind_all("<MouseWheel>", on_wheel)
 
     # ---------- 提词器模式（F8）：贴镜头小窗 + 大字 + 自动滚动 ----------
@@ -293,18 +350,27 @@ def show_answer_window(ui_q):
                     hist.append({"q": str(payload), "a": ""})
                     cur = -1                    # 跟随最新
                     VIEW["stage"] = "answering"
-                    render()
+                    A_WATCH["ts"] = 0.0
+                    render("top")
                 elif kind == "a":               # 回答（流式）：更新当前对话
                     idx = len(hist) - 1 if cur < 0 else cur
                     if 0 <= idx < len(hist):
                         hist[idx]["a"] = str(payload)
-                    VIEW["stage"] = "done"
-                    render()
+                    # engine 约定：中间帧 = 部分答案 + "…"，最终帧 = 完整答案（无省略号）。
+                    # 原来无条件置 done —— 边生成边显示"✅ 回答完成 · F1 录下一题"，误导。
+                    if str(payload).endswith("…"):
+                        VIEW["stage"] = "answering"
+                        A_WATCH["ts"] = time.time()
+                    else:
+                        VIEW["stage"] = "done"
+                        A_WATCH["ts"] = 0.0
+                    render("tail")
                 elif kind == "vision":          # Alt+P 截图识图：独立一轮
                     hist.append({"q": "📸 屏幕截图", "a": str(payload)})
                     cur = -1
                     VIEW["stage"] = "done"
-                    render()
+                    A_WATCH["ts"] = 0.0
+                    render("top")               # 整段答案一次到位：从【思路】读起
                     # 同步推手机（测评场景兜底：窗口藏了/鼠标不出页面也能看答案）
                     if push_on["on"] and str(payload) and not str(payload).startswith("❌"):
                         push_answer("📸 屏幕截图", payload)
@@ -341,6 +407,14 @@ def show_answer_window(ui_q):
             except Exception as e:
                 # 单个事件出错不能杀死整个 poll：记日志继续收下一个
                 log_event({"type": "ui_error", "kind": kind, "err": str(e)[:200]})
+        # 静默兜底：真答案以省略号结尾时（模型常用"…"收尾）末帧判不出"完成"，
+        # 状态行会一直停在"生成中"——超过 SILENT_DONE_SEC 没有新帧即视为生成结束。
+        # 只兜"已经在流式"的情况（A_WATCH 有值），不影响"q 之后 API 还在首字等待"。
+        if (VIEW["stage"] == "answering" and A_WATCH["ts"]
+                and time.time() - A_WATCH["ts"] > SILENT_DONE_SEC):
+            A_WATCH["ts"] = 0.0
+            VIEW["stage"] = "done"
+            render("keep")       # 保持当前位置：用户可能正读到一半
         # 提词器自动滚动（到底部自动停，滚轮可手动覆盖）
         if tp["on"]:
             tp["tick"] += 1

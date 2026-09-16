@@ -1,4 +1,5 @@
 .env
+resume.md
 __pycache__/
 logs/
 *.wav
