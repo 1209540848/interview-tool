@@ -63,6 +63,8 @@ class Recorder:
         dev = self.device
         if dev is None or self.mode == "tcp":
             return   # tcp 模式：面试官音频由 loop_tcp_thread 直接喂 _process，不开声卡流
+        # stop() 会置位该事件；重新打开流前必须清除，否则 callback/read 线程会立即丢弃数据。
+        self._stop.clear()
         sr = int(dev["defaultSampleRate"])
         ch = int(dev["maxInputChannels"]) or 1
         self._sr, self._ch = sr, ch

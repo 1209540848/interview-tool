@@ -2,8 +2,8 @@
 """engine.py — 统一编排主本（quiz 测评版 / code 笔试版共享一份 main）。
 
 由 tools/gen_engine.py 从旧 code 版单体的 main() 生成（锚点校验后可重跑），
-文本切片 + 登记点编辑见生成器 docstring；场景差异一律经 profiles.ACTIVE 取用，
-本模块内除 profile.key 分叉外零场景判断。禁止手改（要改先改源再重新生成）。
+文本切片 + 登记点编辑见生成器 docstring；quiz/code 运行差异经 profiles.ACTIVE 取用，
+用户技术场景由 PromptStore 注入。禁止手改（要改需同步 tools/gen_engine.py）。
 
 模块级 import 三组：标准库 / 第三方（numpy、pyaudiowpatch——与原单体同款别名）/
 interview_tool 内各模块。属主规则（R1/R2）与差异收容表见 profiles.py docstring。
@@ -25,7 +25,7 @@ import pyaudiowpatch as pyaudio
 from . import log, profiles, typing_code, typing_quiz
 from .asr import clean_asr_text, transcribe
 from .audio import Recorder, WavWriter, loop_tcp_thread, pick_loopback_device
-from .chat import ChatAgent, DEEPSEEK_MODEL, build_system_prompt
+from .chat import ChatAgent, DEEPSEEK_MODEL, DEEPSEEK_URL, build_system_prompt
 from .config import (AUTO_ATTACH_ON, B_TRIGGER_SEC, BLOCK,
                      ESCAPE_COOLDOWN, GATE_ESCAPE_ABS, GATE_ESCAPE_RATIO,
                      GATE_RECYCLE_SEC, LOG_DIR, MIN_UTTERANCE_SEC,
@@ -33,25 +33,28 @@ from .config import (AUTO_ATTACH_ON, B_TRIGGER_SEC, BLOCK,
                      SAMPLE_RATE, _env_get)
 from .dsp import GateState, SpeechDetector
 from .log import log_event
+from .prompt_store import PromptStore
 from .push import push_answer
 from .state import (ACRYLIC, CHAMELEON, TYPING_STATE, VISION_STATE, push_on,
                     stealth)
 from .typing_code import _after_alt_release, paste_answer_into_foreground
 from .ui import hist, load_history_from_logs, save_window_geometry, \
     show_answer_window
-from .vision import _vis_mem_reset, do_vision
+from .vision import _vis_mem_reset, _vision_providers, do_vision
 from .winfx import set_capture_excluded
 
 
 def main(profile):
     profiles.ACTIVE = profile        # flavor 激活：分叉段与 ACTIVE.* 字段取用（run_quiz/run_code 传入）
+    prompt_store = PromptStore()     # 技术场景独立于 quiz/code；任意时刻只激活一个
     # 打字实现注入：quiz 裸 1 走简化打字（原文语义）；code Alt+1 走 _after_alt_release 包 code 版
     type_answer_into_foreground = (typing_quiz.type_answer_into_foreground
                                    if profile.key == "quiz"
                                    else typing_code.type_answer_into_foreground)
     ap = argparse.ArgumentParser()
     ap.add_argument("--api-key", default=None, help="DeepSeek API key（默认读 .env DEEPSEEK_API_KEY）")
-    ap.add_argument("--model", default=DEEPSEEK_MODEL)
+    ap.add_argument("--model", default=None,
+                    help="问答模型名（默认随所选后端：DeepSeek 或主视觉模型）")
     ap.add_argument("--no-inject", action="store_true", help="只转写不调 API（测链路）")
     ap.add_argument("--no-window", action="store_true", help="不显示答案窗（纯转写测试）")
     ap.add_argument("--acrylic", action="store_true", help="磨砂玻璃背景（DWM Acrylic）替代灰色实底")
@@ -70,13 +73,32 @@ def main(profile):
     ACRYLIC["on"] = args.acrylic   # 模块级标志：答案窗按此决定磨砂玻璃 / 灰色实底
     CHAMELEON["on"] = args.chameleon
 
-    api_key = args.api_key or _env_get("DEEPSEEK_API_KEY")
+    # 问答后端优先级：显式 --api-key / DEEPSEEK_API_KEY → DeepSeek；否则复用
+    # 主识图链路的 key、模型和 URL。视觉模型是多模态模型，也可接收纯文本问题。
+    deepseek_key = args.api_key or _env_get("DEEPSEEK_API_KEY")
+    _vision_tag, vision_key, vision_model, vision_url = _vision_providers()[0]
+    if deepseek_key:
+        api_key = deepseek_key
+        answer_model = args.model or DEEPSEEK_MODEL
+        answer_url = DEEPSEEK_URL
+        answer_backend = "DeepSeek"
+    else:
+        api_key = vision_key
+        answer_model = args.model or vision_model
+        answer_url = vision_url
+        answer_backend = "识图链路多模态模型"
     if not args.no_inject and not api_key:
-        sys.exit("❌ 缺少 DEEPSEEK_API_KEY：在 .env 加一行或用 --api-key 指定")
-    print(f"🤖 API: {args.model}", flush=True)
+        sys.exit("❌ 缺少问答模型凭证：请填写 DEEPSEEK_API_KEY，或配置识图链路的 ARK_API_KEY")
+    print(f"🤖 问答 API: {answer_backend} / {answer_model}", flush=True)
+    active_scene = prompt_store.get_active_scene()
+    print(f"🎯 Prompt 场景: {active_scene['name']}", flush=True)
+    if prompt_store.load_error:
+        print(f"⚠️ Prompt 场景配置读取失败，已回退默认：{prompt_store.load_error}", flush=True)
 
     # 本场日志：logs/session-时间戳.jsonl（重启提词器 = 新一场）
-    log.start_session(args.model, args.no_inject)   # R3 注入：原 4 行块（global 声明+建目录+命名+session_start）封装
+    log.start_session(answer_model, args.no_inject)   # R3 注入：原 4 行块（global 声明+建目录+命名+session_start）封装
+    log_event({"type": "prompt_scene", "scene_id": active_scene["id"],
+               "scene_name": active_scene["name"], "reason": "session_start"})
 
     # 崩溃兜底：hidden-start 启动无控制台，任何线程异常都落到 logs/interview-crash.log
     def _crash_hook(etype, val, tb):
@@ -95,7 +117,9 @@ def main(profile):
     sys.excepthook = _crash_hook
 
     # 全局状态 + UI 事件队列
-    state = {"mode": "listen", "paused": False, "tp": False}   # listen=只听 / full=全听 / tp=提词器
+    # 手动模式默认全听，让 F1/F2 同时收回环和麦克风；F10 仍可切到只听。
+    state = {"mode": "full" if args.manual else "listen",
+             "paused": False, "tp": False}   # listen=只听 / full=全听 / tp=提词器
     epoch = {"n": 0}            # 每检测到新语音 +1；答案回来时序号不符 → 作废
     st_lock = threading.Lock()
     ui_q = queue.Queue()
@@ -113,15 +137,28 @@ def main(profile):
     if hist:
         print(f"📜 历史恢复: {len(hist)} 个对话（↑↓ 翻看）", flush=True)
 
+    agent = None
+
+    def on_prompt_apply(scene):
+        """设置窗口回调：两条链路一起切换，保留 UI 历史但重置模型私有上下文。"""
+        _vis_mem_reset("Prompt 场景切换")
+        if agent is not None:
+            agent.schedule_system_prompt(build_system_prompt(prompt_store),
+                                         reset_history=True)
+        log_event({"type": "prompt_scene", "scene_id": scene["id"],
+                   "scene_name": scene["name"], "reason": "user_apply"})
+        ui("status", f"🎯 场景已切换：{scene['name']} · 下一题生效")
+        print(f"🎯 Prompt 场景已切换: {scene['name']}（下一题生效）", flush=True)
+
     root = None
     if not args.no_window:
-        root = show_answer_window(ui_q)
-        set_capture_excluded(root, stealth["on"])   # 防捕获常驻开：共享/录屏画面里答案窗不可见
+        root = show_answer_window(ui_q, prompt_store=prompt_store,
+                                  on_prompt_apply=on_prompt_apply)
+        set_capture_excluded(root, stealth["on"])   # 防捕获常驻开启
 
-    agent = None
     if not args.no_inject:
-        agent = ChatAgent(api_key, model=args.model,
-                          system_prompt=build_system_prompt())
+        agent = ChatAgent(api_key, model=answer_model,
+                          system_prompt=build_system_prompt(prompt_store), base_url=answer_url)
 
     # 问答工作线程（串行调 API；答案作废判定靠 epoch 序号）
     # 警告：严禁并行化！void_last 替换 messages 最后一条 assistant 依赖串行顺序，
@@ -466,17 +503,17 @@ def main(profile):
         print(f"🎙 全程录音落盘: {wav_dir}", flush=True)
 
     # 热键轮询（GetAsyncKeyState：F10 切模式 / F9 临时麦克风 /
-    # F4 隐藏窗口 / F8 提词器模式 / F7 防捕获 / F6 手机推送 / Ctrl+Esc 暂停 /
+    # F4 隐藏窗口 / F8 提词器模式 / F6 手机推送 / Ctrl+Esc 暂停 /
     # Alt+P 识图 / Alt+1 打字 / Alt+2 粘贴 / Alt+3 清识图记忆——笔试写码安全的组合键）
     VK_F1, VK_F2 = 0x70, 0x71
     VK_F4 = 0x73    # VK_F3 已废弃：识图收敛到 Alt+P，裸 F3 在浏览器/IDE 有默认行为不再占用
     VK_F3 = 0x72    # quiz 测评版主键：F3/P 裸键识图（code 场景废弃——f3/p 槽无人读写）
-    VK_F6, VK_F7, VK_F8, VK_F9, VK_F10 = 0x75, 0x76, 0x77, 0x78, 0x79
+    VK_F6, VK_F8, VK_F9, VK_F10 = 0x75, 0x77, 0x78, 0x79
     VK_ESC, VK_CTRL, VK_Q = 0x1B, 0x11, 0x51
     VK_ALT = 0x12
     VK_UP, VK_DOWN = 0x26, 0x28
     hk = {"f10": False, "esc": False, "f4": False, "f8": False,
-          "f7": False, "f6": False, "f1": False, "f2": False,
+          "f6": False, "f1": False, "f2": False,
           "f9": False, "up": False, "down": False, "esc_alone": False,
           "altp": False, "alt1": False, "alt2": False, "alt3": False,
           "f3": False, "p": False, "d1": False}   # quiz 测评版槽位（code 场景无人读写）
@@ -530,8 +567,10 @@ def main(profile):
                     set_status("⏸️ 已暂停 · Ctrl+Esc恢复")
                 else:
                     recorder_loop.start()
-                    if recorder_mic and not args.manual:
-                        recorder_mic.start()   # 自动模式：麦克风轨常开（me.wav 全程落盘）
+                    with st_lock:
+                        mic_should_run = not args.manual or state["mode"] == "full"
+                    if recorder_mic and mic_should_run:
+                        recorder_mic.start()
                     if not args.manual:
                         event_q.put(("reset", None))   # 清 pending/detector/门控（防陈年触发）
                     print("▶️ 已恢复", flush=True)
@@ -598,7 +637,7 @@ def main(profile):
                 if not VISION_STATE["busy"] and ((f3 and not hk["f3"]) or (pkey and not hk["p"])):
                     VISION_STATE["busy"] = True
                     set_status("📝 测评识图中…")
-                    threading.Thread(target=do_vision, args=(ui,), daemon=True).start()
+                    threading.Thread(target=do_vision, args=(ui, prompt_store), daemon=True).start()
                 hk["f3"] = f3
                 hk["p"] = pkey
                 # 数字 1：把最新识图答案模拟真人打字打进当前焦点输入框（再按 1 = 停止）。
@@ -633,7 +672,7 @@ def main(profile):
                     else:
                         VISION_STATE["busy"] = True
                         set_status("💻 笔试识图中…（同题续截自动带上下文）")
-                        threading.Thread(target=do_vision, args=(ui,), daemon=True).start()
+                        threading.Thread(target=do_vision, args=(ui, prompt_store), daemon=True).start()
                 hk["altp"] = altp
                 # Alt+1：把最新识图答案模拟真人打字打进当前焦点输入框（再按 Alt+1 = 停止）。
                 # 只在有答案待打时生效——平时 1 键不劫持，答题框里正常输 1
@@ -675,6 +714,7 @@ def main(profile):
                 alt3 = alt and key_down(0x33)               # VK_3
                 if alt3 and not hk["alt3"]:
                     dropped = _vis_mem_reset("Alt+3 手动清空")
+                    ui("vision_reset")               # 清掉当前显示/旧答案待输入态，历史仍可回看
                     if dropped:
                         print("🧹 识图多轮记忆已清空（截图+旧解答全丢）", flush=True)
                         ui("status", "🧹 识图记忆已清空（Alt+3）")
@@ -684,7 +724,9 @@ def main(profile):
             # F4 隐藏/显示窗口（面试官靠近/共享屏幕时一键藏）
             f4 = key_down(VK_F4)
             if f4 and not hk["f4"] and root is not None:
-                hidden_state["v"] = not hidden_state["v"]
+                hidden_state["v"] = not bool(
+                    getattr(root, "_user_hidden", hidden_state["v"]))
+                root._user_hidden = hidden_state["v"]
                 if hidden_state["v"]:
                     root.withdraw()
                     print("🙈 窗口已隐藏（再按 F4 显示）", flush=True)
@@ -692,7 +734,7 @@ def main(profile):
                     root.deiconify()
                     print("👁️ 窗口已显示", flush=True)
             hk["f4"] = f4
-            # ↑/↓ 翻历史（上一对话/下一对话；提问+回答同屏）
+            # ↑/↓ 当前页导航：回答页翻历史，笔记页切上一篇/下一篇。
             up = key_down(VK_UP)
             if up and not hk["up"]:
                 ui("nav", -1)
@@ -719,16 +761,6 @@ def main(profile):
             elif not f9 and hk["f9"] and not args.manual:
                 event_q.put(("f9_off", None))
             hk["f9"] = f9
-            # F7 防捕获开关：共享屏幕/录屏时答案窗从捕获画面里消失（自己仍照常看）
-            f7 = key_down(VK_F7)
-            if f7 and not hk["f7"]:
-                stealth["on"] = not stealth["on"]
-                if root is not None:
-                    ok = set_capture_excluded(root, stealth["on"])
-                    print(f"🕶️ 防捕获: {'开（共享/录屏画面里答案窗不可见）' if stealth['on'] else '关'}"
-                          + ("" if ok else "（设置失败）"), flush=True)
-                    set_status(("🕶️ 防捕获开" if stealth["on"] else "防捕获关") + " · F7切换")
-            hk["f7"] = f7
             # F6 手机推送开关（兜底渠道，启动常驻开）
             f6 = key_down(VK_F6)
             if f6 and not hk["f6"]:
@@ -746,15 +778,16 @@ def main(profile):
 
     threading.Thread(target=hotkey_loop, daemon=True).start()
 
-    # 启动：录音流常开（F1/F2 控制攒与不攒）；防捕获与手机推送已常驻开
+    # 启动：录音流常开（F1/F2 控制攒与不攒）；防捕获与手机推送常驻开
     recorder_loop.start()
+    if recorder_mic:
+        recorder_mic.start()   # 自动模式常开；手动模式默认全听，F1/F2 同时收两轨
     if not args.manual:
-        recorder_mic.start()   # 自动模式：麦克风轨常开（门控由编排线程仲裁）
         print(profiles.ACTIVE.banner_auto, flush=True)   # 就绪横幅原文在 profiles（两版差异收容）
         set_status("🕶️ 防捕获开 · 📱 推送开 · 自动模式")
     else:
         print(profiles.ACTIVE.banner_manual, flush=True)   # 就绪横幅原文在 profiles（两版差异收容）
-        set_status("🕶️ 防捕获开 · 📱 推送开 · 手动模式")
+        set_status("🕶️ 防捕获开 · 📱 推送开 · 手动全听模式 · F10切换")
     print("=" * 50, flush=True)
 
     if root is not None:

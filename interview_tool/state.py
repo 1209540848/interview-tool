@@ -9,9 +9,10 @@ TYPING_STATE 取 code 版 6 键超集（含 pos/start_ts）；quiz 版 4 键是�
 quiz 永不引用——可选能力在场而非缺席。
 """
 import os
+import threading
 
 # ---------- 防屏幕捕获：SetWindowDisplayAffinity（WDA_EXCLUDEFROMCAPTURE） ----------
-stealth = {"on": os.environ.get("SHOW_WINDOW_IN_CAPTURE") != "1"}   # F7 防捕获状态（常驻开；调试可设 SHOW_WINDOW_IN_CAPTURE=1 关掉防捕获便于截图验证）
+stealth = {"on": True}   # 防捕获固定常驻开启；不提供运行时关闭开关
 ACRYLIC = {"on": False}  # --acrylic 启动参数：磨砂玻璃背景（DWM Acrylic）替代灰色实底。模块级同上
 CHAMELEON = {"on": False}  # --chameleon 启动参数：吸窗口下方屏幕颜色做底板，文字自动深浅（变色龙）
 
@@ -30,4 +31,5 @@ TYPING_STATE = {"armed": False, "busy": False, "stop": False, "paused": False,
 # 存最近 6 张历史截图(b64, q80/最长边≤1440) + 最近 4 条成功解答；Alt+3 手动清空
 # 容量权衡：6 张≈「题目+样例+连续3轮报错修复」完整链条，够长题的来回改错；
 # 再多每轮请求体/图 token 翻倍增长，且长尾信息模型已消化过——该按 Alt+3 换新题了
-VIS_MEM = {"imgs": [], "ans": []}
+VIS_MEM = {"imgs": [], "ans": [], "generation": 0}
+VIS_MEM_LOCK = threading.Lock()   # Alt+3 可与在途识图线程并发，快照/清空/回写必须原子

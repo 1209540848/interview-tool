@@ -4,7 +4,7 @@
 
 engine.py = code 版主逻辑（行为主本）+ 登记点编辑：
   (a) def main(): → def main(profile): + ACTIVE 激活 + 打字实现按 flavor 注入
-  (b) 原 global LOG_FILENAME 4 行块 → log.start_session(args.model, args.no_inject)（R3 模块注入）
+  (b) 原 global LOG_FILENAME 4 行块 → log.start_session(answer_model, args.no_inject)（R3 模块注入）
   (c) wav 落盘目录引用 LOG_FILENAME → log.LOG_FILENAME（R2 属主访问，只读）
   (d) 补 VK_F3 = 0x72（quiz 测评版主键；code 场景废弃——f3/p 槽无人读写）
   (e) hk dict 追加 f3/p/d1 三槽（quiz 测评版键位；code 场景无人读写=无害）
@@ -12,6 +12,9 @@ engine.py = code 版主逻辑（行为主本）+ 登记点编辑：
   (g) 识图/注入分歧段 → if profile.key == "quiz": <quiz 原文整段> else: <code 原文整段>
       （两段文本各自从对应单体原行切片，程序化缩进）
   (h) 就绪横幅两处 print(多行常量) → print(profiles.ACTIVE.banner_auto/manual, flush=True)
+  (i) 问答后端选择：DEEPSEEK_API_KEY 优先；未配置时复用主视觉模型三件套
+  (j) 移除 F7 防捕获开关；防捕获由 state 固定常驻开启
+  (k) 注入单活动 PromptStore：设置窗口切场景、语音下一题换 system、截图按场景快照
 
 所有点编辑的缩进一律从锚点行推导（不硬编码列号）；每个编辑的目标文本都做内容断言，
 源文件漂移即中止 → 生成器可放心重跑。引擎自身除 profile.key 分叉外零场景判断——
@@ -82,9 +85,73 @@ def main():
     b_pad = " " * ind_of(code_l[b_head - 1])
     edits.append((b_head, b_head + 4, [
         code_l[b_head - 1],
-        b_pad + "log.start_session(args.model, args.no_inject)"
+        b_pad + "log.start_session(answer_model, args.no_inject)"
                 "   # R3 注入：原 4 行块（global 声明+建目录+命名+session_start）封装",
     ]))
+
+    # (i) 问答后端：DeepSeek key 优先；没有则复用主识图链路的多模态模型。
+    # --model 默认必须改成 None，才能根据最终选中的后端取各自默认模型。
+    model_line = find_line(code_l, 'ap.add_argument("--model", default=DEEPSEEK_MODEL)')
+    model_pad = " " * ind_of(code_l[model_line - 1])
+    edits.append((model_line, model_line, [
+        model_pad + 'ap.add_argument("--model", default=None,',
+        model_pad + '                help="问答模型名（默认随所选后端：DeepSeek 或主视觉模型）")',
+    ]))
+
+    select_head = find_line(code_l, 'api_key = args.api_key or _env_get("DEEPSEEK_API_KEY")')
+    assert "if not args.no_inject and not api_key:" in code_l[select_head]
+    assert "sys.exit(" in code_l[select_head + 1]
+    assert 'print(f"🤖 API: {args.model}"' in code_l[select_head + 2]
+    select_pad = " " * ind_of(code_l[select_head - 1])
+    edits.append((select_head, select_head + 3, [
+        select_pad + "# 问答后端优先级：显式 --api-key / DEEPSEEK_API_KEY → DeepSeek；否则复用",
+        select_pad + "# 主识图链路的 key、模型和 URL。视觉模型是多模态模型，也可接收纯文本问题。",
+        select_pad + 'deepseek_key = args.api_key or _env_get("DEEPSEEK_API_KEY")',
+        select_pad + '_vision_tag, vision_key, vision_model, vision_url = _vision_providers()[0]',
+        select_pad + "if deepseek_key:",
+        select_pad + "    api_key = deepseek_key",
+        select_pad + "    answer_model = args.model or DEEPSEEK_MODEL",
+        select_pad + "    answer_url = DEEPSEEK_URL",
+        select_pad + '    answer_backend = "DeepSeek"',
+        select_pad + "else:",
+        select_pad + "    api_key = vision_key",
+        select_pad + "    answer_model = args.model or vision_model",
+        select_pad + "    answer_url = vision_url",
+        select_pad + '    answer_backend = "识图链路多模态模型"',
+        select_pad + "if not args.no_inject and not api_key:",
+        select_pad + '    sys.exit("❌ 缺少问答模型凭证：请填写 DEEPSEEK_API_KEY，或配置识图链路的 ARK_API_KEY")',
+        select_pad + 'print(f"🤖 问答 API: {answer_backend} / {answer_model}", flush=True)',
+    ]))
+
+    agent_head = find_line(code_l, "agent = ChatAgent(api_key, model=args.model,")
+    assert "system_prompt=build_system_prompt())" in code_l[agent_head]
+    agent_pad = " " * ind_of(code_l[agent_head - 1])
+    edits.append((agent_head, agent_head + 1, [
+        agent_pad + "agent = ChatAgent(api_key, model=answer_model,",
+        agent_pad + "                  system_prompt=build_system_prompt(), base_url=answer_url)",
+    ]))
+
+    # (j) 防捕获固定常驻开启：释放 F7，不生成按键常量、状态槽和切换逻辑。
+    hotkey_comment = find_line(code_l, "/ F7 防捕获 /")
+    edits.append((hotkey_comment, hotkey_comment, [
+        code_l[hotkey_comment - 1].replace(" / F7 防捕获", ""),
+    ]))
+
+    f7_vks = find_line(code_l, "VK_F6, VK_F7, VK_F8, VK_F9, VK_F10")
+    f7_vks_pad = " " * ind_of(code_l[f7_vks - 1])
+    edits.append((f7_vks, f7_vks, [
+        f7_vks_pad + "VK_F6, VK_F8, VK_F9, VK_F10 = 0x75, 0x77, 0x78, 0x79",
+    ]))
+
+    f7_slot = find_line(code_l, '"f7": False, "f6": False')
+    edits.append((f7_slot, f7_slot, [
+        code_l[f7_slot - 1].replace('"f7": False, ', ""),
+    ]))
+
+    f7_head = find_line(code_l, "# F7 防捕获开关：")
+    f7_tail = find_line(code_l, 'hk["f7"] = f7')
+    assert f7_tail > f7_head
+    edits.append((f7_head, f7_tail, []))
 
     # (c) wav 落盘目录：裸 LOG_FILENAME（原 global）→ log.LOG_FILENAME 属主访问
     w_line = find_line(code_l, "wav_dir = os.path.join(LOG_DIR, LOG_FILENAME[:-6]")
@@ -194,18 +261,76 @@ def main():
     body[0:1] = [
         "def main(profile):",
         "    profiles.ACTIVE = profile        # flavor 激活：分叉段与 ACTIVE.* 字段取用（run_quiz/run_code 传入）",
+        "    prompt_store = PromptStore()     # 技术场景独立于 quiz/code；任意时刻只激活一个",
         "    # 打字实现注入：quiz 裸 1 走简化打字（原文语义）；code Alt+1 走 _after_alt_release 包 code 版",
         "    type_answer_into_foreground = (typing_quiz.type_answer_into_foreground",
         "                                   if profile.key == \"quiz\"",
         "                                   else typing_code.type_answer_into_foreground)",
     ]
 
+    # (k) Prompt 场景编排。放在切片完成后的 body 上做锚点编辑，避免污染旧单体源。
+    def body_find(key):
+        hits = [i for i, line in enumerate(body) if key in line]
+        if len(hits) != 1:
+            raise SystemExit(f"body 锚 '{key[:60]}' 命中 {len(hits)} 处（期望 1）")
+        return hits[0]
+
+    p_api = body_find('print(f"🤖 问答 API: {answer_backend} / {answer_model}"') + 1
+    body[p_api:p_api] = [
+        "    active_scene = prompt_store.get_active_scene()",
+        "    print(f\"🎯 Prompt 场景: {active_scene['name']}\", flush=True)",
+        "    if prompt_store.load_error:",
+        "        print(f\"⚠️ Prompt 场景配置读取失败，已回退默认：{prompt_store.load_error}\", flush=True)",
+    ]
+    p_log = body_find("log.start_session(answer_model, args.no_inject)") + 1
+    body[p_log:p_log] = [
+        '    log_event({"type": "prompt_scene", "scene_id": active_scene["id"],',
+        '               "scene_name": active_scene["name"], "reason": "session_start"})',
+    ]
+
+    p_root = body_find("    root = None")
+    p_agent_tail = body_find("system_prompt=build_system_prompt(), base_url=answer_url)")
+    body[p_root:p_agent_tail + 1] = [
+        "    agent = None",
+        "",
+        "    def on_prompt_apply(scene):",
+        '        """设置窗口回调：两条链路一起切换，保留 UI 历史但重置模型私有上下文。"""',
+        '        _vis_mem_reset("Prompt 场景切换")',
+        "        if agent is not None:",
+        "            agent.schedule_system_prompt(build_system_prompt(prompt_store),",
+        "                                         reset_history=True)",
+        '        log_event({"type": "prompt_scene", "scene_id": scene["id"],',
+        '                   "scene_name": scene["name"], "reason": "user_apply"})',
+        '        ui("status", f"🎯 场景已切换：{scene[\'name\']} · 下一题生效")',
+        '        print(f"🎯 Prompt 场景已切换: {scene[\'name\']}（下一题生效）", flush=True)',
+        "",
+        "    root = None",
+        "    if not args.no_window:",
+        "        root = show_answer_window(ui_q, prompt_store=prompt_store,",
+        "                                  on_prompt_apply=on_prompt_apply)",
+        '        set_capture_excluded(root, stealth["on"])   # 防捕获常驻开启',
+        "",
+        "    if not args.no_inject:",
+        "        agent = ChatAgent(api_key, model=answer_model,",
+        "                          system_prompt=build_system_prompt(prompt_store), base_url=answer_url)",
+    ]
+    vision_calls = [i for i, line in enumerate(body)
+                    if "threading.Thread(target=do_vision, args=(ui,)," in line]
+    if len(vision_calls) != 2:
+        raise SystemExit(f"do_vision 调用应为 2 处，实际 {len(vision_calls)}")
+    for i in vision_calls:
+        body[i] = body[i].replace("args=(ui,)", "args=(ui, prompt_store)")
+    alt3_reset = body_find('dropped = _vis_mem_reset("Alt+3 手动清空")') + 1
+    body[alt3_reset:alt3_reset] = [
+        '                    ui("vision_reset")               # 清掉当前显示/旧答案待输入态，历史仍可回看',
+    ]
+
     PRELUDE = '''# -*- coding: utf-8 -*-
 """engine.py — 统一编排主本（quiz 测评版 / code 笔试版共享一份 main）。
 
 由 tools/gen_engine.py 从旧 code 版单体的 main() 生成（锚点校验后可重跑），
-文本切片 + 登记点编辑见生成器 docstring；场景差异一律经 profiles.ACTIVE 取用，
-本模块内除 profile.key 分叉外零场景判断。禁止手改（要改先改源再重新生成）。
+文本切片 + 登记点编辑见生成器 docstring；quiz/code 运行差异经 profiles.ACTIVE 取用，
+用户技术场景由 PromptStore 注入。禁止手改（要改需同步 tools/gen_engine.py）。
 
 模块级 import 三组：标准库 / 第三方（numpy、pyaudiowpatch——与原单体同款别名）/
 interview_tool 内各模块。属主规则（R1/R2）与差异收容表见 profiles.py docstring。
@@ -227,7 +352,7 @@ import pyaudiowpatch as pyaudio
 from . import log, profiles, typing_code, typing_quiz
 from .asr import clean_asr_text, transcribe
 from .audio import Recorder, WavWriter, loop_tcp_thread, pick_loopback_device
-from .chat import ChatAgent, DEEPSEEK_MODEL, build_system_prompt
+from .chat import ChatAgent, DEEPSEEK_MODEL, DEEPSEEK_URL, build_system_prompt
 from .config import (AUTO_ATTACH_ON, B_TRIGGER_SEC, BLOCK,
                      ESCAPE_COOLDOWN, GATE_ESCAPE_ABS, GATE_ESCAPE_RATIO,
                      GATE_RECYCLE_SEC, LOG_DIR, MIN_UTTERANCE_SEC,
@@ -235,13 +360,14 @@ from .config import (AUTO_ATTACH_ON, B_TRIGGER_SEC, BLOCK,
                      SAMPLE_RATE, _env_get)
 from .dsp import GateState, SpeechDetector
 from .log import log_event
+from .prompt_store import PromptStore
 from .push import push_answer
 from .state import (ACRYLIC, CHAMELEON, TYPING_STATE, VISION_STATE, push_on,
                     stealth)
 from .typing_code import _after_alt_release, paste_answer_into_foreground
 from .ui import hist, load_history_from_logs, save_window_geometry, \\
     show_answer_window
-from .vision import _vis_mem_reset, do_vision
+from .vision import _vis_mem_reset, _vision_providers, do_vision
 from .winfx import set_capture_excluded
 '''
 
