@@ -117,6 +117,20 @@ vis_m = top_assign(QUIZ, "VISION_MAX_TOKENS", True), top_assign(CODE, "VISION_MA
 ba_q, bm_q = banner_texts(QUIZ)
 ba_c, bm_c = banner_texts(CODE)
 
+# 防捕获现为不可关闭的常驻能力；旧单体横幅仍写着 F7/F6 均可关闭，生成时收敛掉 F7。
+_old_switch_note = "🕶️ 防捕获常驻开，📱 手机推送常驻开（F7/F6 可关）。"
+_fixed_switch_note = "🕶️ 防捕获常驻开，📱 手机推送常驻开（F6 可关）。"
+
+def fixed_capture_banner(name, value):
+    if _old_switch_note not in value:
+        raise SystemExit(f"{name}: 找不到旧 F7 横幅文本，源文件可能已漂移")
+    return value.replace(_old_switch_note, _fixed_switch_note)
+
+ba_q = fixed_capture_banner("ba_q", ba_q)
+bm_q = fixed_capture_banner("bm_q", bm_q)
+ba_c = fixed_capture_banner("ba_c", ba_c)
+bm_c = fixed_capture_banner("bm_c", bm_c)
+
 # ---------- 窗口差异方法体切片（替换点登记） ----------
 # place_window body：quiz = 986-988 三行（注释+取屏宽+单行几何）；code = 992-998 七行
 # （注释+取屏宽+恢复上次位置，无则 760x460 默认放大窗）。_sw 方法内自算，调用方只传 root。

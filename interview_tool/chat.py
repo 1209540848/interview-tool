@@ -1,24 +1,30 @@
 # -*- coding: utf-8 -*-
-"""chat.py — DeepSeek 聊天协议（ChatAgent）。
+"""chat.py — OpenAI 兼容聊天协议（ChatAgent）。
 
-系统提示词收敛为 profiles.ACTIVE.system_prompt（两版差异文本收进 profiles.py）；
-模块只读期 ACTIVE 为 None——本模块只在 engine.main 激活后才会被调用，无空窗。
-SYSTEM_PROMPT 模块常量已随收敛移除：差异文本唯 1 副本 = profiles 字段，杜绝双抄漂移。
+系统提示词由 profiles.ACTIVE.system_prompt（quiz/code 运行协议）与 PromptStore（单选技术
+场景）组合；模块只读期 ACTIVE 为 None——只在 engine.main 激活后调用。
 """
 import json
 import threading
 
 from .config import RESUME_FILE, RESUME_MAX_CHARS
-from . import profiles          # 提示词取 ACTIVE.system_prompt（差异文本在 profiles，本模块零场景判断）
+from . import profiles          # quiz/code 基础规则取 ACTIVE；技术场景由调用方注入 PromptStore
 
-# ---------- DeepSeek（OpenAI 兼容） ----------
+# ---------- 默认问答后端：DeepSeek（未配 key 时由 engine 改用主视觉后端） ----------
 DEEPSEEK_URL = "https://api.deepseek.com/chat/completions"
 DEEPSEEK_MODEL = "deepseek-chat"
 HISTORY_TURNS = 5            # 保留最近 N 轮问答（追问承接；10 轮历史太长会带偏新话题）
+VOICE_ANSWER_STRUCTURE = (
+    "回答必须先总后分：开头先用 1—2 句话概括核心结论和关键点，直接回答问题；"
+    "不要从定义、背景或发展过程开始铺垫。随后再按重要性展开原因、步骤、权衡和必要示例。"
+    "简单问题在概括后补充 1—3 个要点即可，不为凑结构扩写。"
+)
 
-def build_system_prompt():
-    """ACTIVE.system_prompt + resume.md 简历（≤RESUME_MAX_CHARS；文件缺失/读失败 → 警告跳过不炸）"""
-    sp = profiles.ACTIVE.system_prompt       # 收敛编辑：原 SYSTEM_PROMPT 模块常量 → profiles 字段（差异收容）
+def build_system_prompt(prompt_store=None):
+    """运行模式基础规则 + 先总后分回答结构 + 当前唯一技术场景 + resume.md。"""
+    sp = f"{profiles.ACTIVE.system_prompt}\n\n{VOICE_ANSWER_STRUCTURE}"
+    if prompt_store is not None:
+        sp = prompt_store.compose_voice_prompt(sp)
     try:
         with open(RESUME_FILE, encoding="utf-8") as f:
             resume = f.read().strip()
@@ -31,28 +37,55 @@ def build_system_prompt():
     return sp
 
 
-# ---------- 问答 agent：DeepSeek API + 内存对话历史 ----------
+# ---------- 问答 agent：OpenAI 兼容 API + 内存对话历史 ----------
 class ChatAgent:
     """OpenAI 兼容 API 问答。历史保留最近 HISTORY_TURNS 轮（追问承接）；
     作废轮（新语音打断）通过 drop_last_pair 从历史移除。串行调用，锁保护。"""
-    def __init__(self, api_key, model=DEEPSEEK_MODEL, system_prompt=None):
+    def __init__(self, api_key, model=DEEPSEEK_MODEL, system_prompt=None,
+                 base_url=DEEPSEEK_URL):
         import requests
         self.session = requests.Session()
         self.api_key = api_key
         self.model = model
+        self.base_url = base_url
         self.messages = [{"role": "system",
                           "content": system_prompt if system_prompt is not None
                           else profiles.ACTIVE.system_prompt}]
         self.lock = threading.Lock()
+        # Prompt 切换不等待在途 HTTP：设置线程只写 pending；串行问答线程在下一题开头应用。
+        self._prompt_lock = threading.Lock()
+        self._pending_prompt = None
+        self._pending_reset = True
+
+    def schedule_system_prompt(self, system_prompt, *, reset_history=True):
+        """让新 Prompt 从下一次 ask_stream 生效；当前流式回答不被打断。"""
+        with self._prompt_lock:
+            self._pending_prompt = system_prompt
+            self._pending_reset = bool(reset_history)
+
+    def _apply_pending_prompt(self):
+        with self._prompt_lock:
+            prompt = self._pending_prompt
+            reset = self._pending_reset
+            self._pending_prompt = None
+        if prompt is None:
+            return
+        if reset:
+            self.messages = [{"role": "system", "content": prompt}]
+        elif self.messages:
+            self.messages[0] = {"role": "system", "content": prompt}
+        else:
+            self.messages = [{"role": "system", "content": prompt}]
 
     def ask_stream(self, question, on_chunk=None, should_stop=None):
         """流式问一轮：边生成边回调 on_chunk(当前全文)，返回完整答案文本。
         should_stop() 返回 True 时中断请求（新语音打断，不再白等生成完）；
         中断时返回已生成的部分文本。异常直接抛给调用方。"""
         with self.lock:
+            self._apply_pending_prompt()
             self.messages.append({"role": "user", "content": question})
             resp = self.session.post(
-                DEEPSEEK_URL,
+                self.base_url,
                 headers={"Authorization": f"Bearer {self.api_key}",
                          "Content-Type": "application/json"},
                 json={"model": self.model, "messages": self.messages,

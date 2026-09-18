@@ -4,13 +4,13 @@
 共享主本取 code 版（code ⊃ quiz）：_ask_vision_multi 多图核心 + VIS_MEM 多轮记忆助手
 为 code 独有能力，quiz 永不引用（可选能力在场）。VISION_MODEL/BASE_URL/FALLBACK_URL
 两版逐字相同故留在本模块。VISION_PROMPT/VISION_MAX_TOKENS/答崩提示按键名两版文本
-不同 → 已收进 profiles.py 的 Profile 字段（vision_prompt/vision_max_tokens/vision_retry），
-do_vision 经 profiles.ACTIVE 取用（调用时解析；engine.main 激活后才被调用，无空窗）。
+不同 → 已收进 profiles.py 的 Profile 字段（vision_prompt/vision_max_tokens/vision_retry）；
+技术方向由 engine 注入的 PromptStore 在每次截图时追加，和运行模式保持解耦。
 do_vision 统一主本（code 版；quiz 问图段更简，同构差异收敛到 profiles）。"""
 from .config import _env_get
 from .log import log_event
-from .state import VIS_MEM, VISION_STATE
-from . import profiles          # 问图差异取 ACTIVE.vision_*（文本唯一副本在 profiles）
+from .state import VIS_MEM, VIS_MEM_LOCK, VISION_STATE
+from . import profiles          # quiz/code 问图协议取 ACTIVE；技术场景由 PromptStore 参数注入
 
 # ---------- Alt+P 截屏识图（手撕代码场景：面试官共享屏幕出题 / 笔试 OJ 截图直接出答案） ----------
 # 兼容两家 OpenAI 风格接口，用 .env 三件套切换，不用改代码：
@@ -27,7 +27,7 @@ VISION_FALLBACK_URL = "https://ark.cn-beijing.volces.com/api/v3/responses"
 # （两版文本不同，删 const 防双抄漂移；code 文本现值见 profiles.CODE.vision_prompt）
 
 
-def _vis_mem_note(img_pil, ans):
+def _vis_mem_note(img_pil, ans, expected_generation=None):
     """识图答成后记一笔：当前截图压 q80/≤1440 存 b64，答案截前 4000 字；
     截图留最近 6 张、解答留最近 4 条（丢最旧——题目图若被挤掉，续截时补一张即可）。
     答崩（❌）不记——失败历史喂回去只会带偏下一轮"""
@@ -42,22 +42,30 @@ def _vis_mem_note(img_pil, ans):
                                      resample=_PImage.LANCZOS)
         buf = _io.BytesIO()
         img_pil.convert("RGB").save(buf, "JPEG", quality=80)
-        VIS_MEM["imgs"].append(_b64.b64encode(buf.getvalue()).decode())
-        if len(VIS_MEM["imgs"]) > 6:
-            del VIS_MEM["imgs"][0]
         a = (ans or "").strip()
-        if a:
-            VIS_MEM["ans"].append(a[:4000])
-            if len(VIS_MEM["ans"]) > 4:
-                del VIS_MEM["ans"][0]
+        encoded = _b64.b64encode(buf.getvalue()).decode()
+        with VIS_MEM_LOCK:
+            if (expected_generation is not None
+                    and VIS_MEM["generation"] != expected_generation):
+                return False                     # Alt+3 已换题：旧请求禁止重新污染记忆
+            VIS_MEM["imgs"].append(encoded)
+            if len(VIS_MEM["imgs"]) > 6:
+                del VIS_MEM["imgs"][0]
+            if a:
+                VIS_MEM["ans"].append(a[:4000])
+                if len(VIS_MEM["ans"]) > 4:
+                    del VIS_MEM["ans"][0]
+        return True
     except Exception:
-        pass                                    # 记忆失败不影响主链路
+        return False                            # 记忆失败不影响主链路
 
 def _vis_mem_reset(why=""):
     """换新题时清空多轮记忆（Alt+3 触发），防旧题截图/旧解答污染新题。返回是否真丢了内容"""
-    n_img, n_ans = len(VIS_MEM["imgs"]), len(VIS_MEM["ans"])
-    VIS_MEM["imgs"] = []
-    VIS_MEM["ans"] = []
+    with VIS_MEM_LOCK:
+        n_img, n_ans = len(VIS_MEM["imgs"]), len(VIS_MEM["ans"])
+        VIS_MEM["imgs"] = []
+        VIS_MEM["ans"] = []
+        VIS_MEM["generation"] += 1              # 让 Alt+3 前已发出的请求结果自动作废
     try:
         log_event({"type": "vis_mem_reset", "why": why,
                    "dropped_imgs": n_img, "dropped_ans": n_ans})
@@ -67,16 +75,33 @@ def _vis_mem_reset(why=""):
 
 def _vis_mem_parts():
     """历史截图 → API parts 列表（旧→新；主流程把最新截图追加在后）"""
-    return [{"b64": b} for b in VIS_MEM["imgs"]]
+    with VIS_MEM_LOCK:
+        return [{"b64": b} for b in VIS_MEM["imgs"]]
 
 def _vis_mem_prompt_suffix():
     """此前成功解答 → prompt 后缀：告诉模型这是上一轮自己给的答案，报错修复/继续优化对照用"""
-    if not VIS_MEM["ans"]:
+    with VIS_MEM_LOCK:
+        answers = list(VIS_MEM["ans"])
+    if not answers:
         return ""
     s = "\n\n【此前解答】（我上一轮给出的回答——报错修复或继续优化时以此为基础改，供对照）：\n"
-    for i, a in enumerate(VIS_MEM["ans"], 1):
+    for i, a in enumerate(answers, 1):
         s += f"——第 {i} 轮解答——\n{a}\n"
     return s
+
+
+def _vis_mem_snapshot():
+    """为一次识图请求冻结同一代的历史，避免 Alt+3 与重试阶段交叉混用。"""
+    with VIS_MEM_LOCK:
+        generation = VIS_MEM["generation"]
+        parts = [{"b64": b} for b in VIS_MEM["imgs"]]
+        answers = list(VIS_MEM["ans"])
+    suffix = ""
+    if answers:
+        suffix = "\n\n【此前解答】（我上一轮给出的回答——报错修复或继续优化时以此为基础改，供对照）：\n"
+        for i, answer in enumerate(answers, 1):
+            suffix += f"——第 {i} 轮解答——\n{answer}\n"
+    return generation, parts, suffix, len(parts)
 
 
 def _vision_parse(j):
@@ -184,7 +209,7 @@ def _vision_providers():
             provs.append(("backup", b_key, b_model, b_url))
     return provs
 
-def do_vision(ui):
+def do_vision(ui, prompt_store=None):
     """Alt+P 识图主流程（后台线程）：全屏截图 →（自动带上同题历史截图+上次解答）→ 识图 API →
     答案窗显示。答成记入多轮记忆；识别失败走冗余链路（2026-09-09）：主模型整图失败 →
     放大重试 → 仍失败自动切备用模型（同一份截图与上下文）→ 备用也放大 → 全失败才报错，
@@ -209,10 +234,18 @@ def do_vision(ui):
         if scale < 1.0:
             img = img.resize((max(1, int(w * scale)), max(1, int(h * scale))),
                              resample=Image.LANCZOS)
-        # 多轮记忆：历史截图（旧→新）+ 当前新图一并发；prompt 附此前解答文本
-        parts = _vis_mem_parts() + [img]
-        prompt = profiles.ACTIVE.vision_prompt + _vis_mem_prompt_suffix()   # 收敛：原 VISION_PROMPT const
-        mem_n = len(VIS_MEM["imgs"])
+        # 多轮记忆与代号一起冻结：Alt+3 后旧请求即使晚回来，也不能重新显示/写回。
+        mem_generation, mem_parts, mem_suffix, mem_n = _vis_mem_snapshot()
+        parts = mem_parts + [img]
+        scene_revision = None
+        scene_id = profiles.ACTIVE.key
+        if prompt_store is not None:
+            prompt, scene, scene_revision = prompt_store.resolve_vision_prompt(
+                profiles.ACTIVE.vision_prompt)
+            scene_id = scene["id"]
+        else:
+            prompt = profiles.ACTIVE.vision_prompt
+        prompt += mem_suffix
         ans = None
         used_tag = "main"                       # 实际答出答案的模型 tag（日志复盘哪个模型救场）
         for tag, pkey, pmodel, purl in providers:
@@ -227,7 +260,7 @@ def do_vision(ui):
                 break
             ui("status", "🔍 整图没认出，放大题目重看中…")
             zoom = _crop_center_zoom(img)
-            ans2, st2 = _ask_vision_retry(pkey, pmodel, purl, _vis_mem_parts() + [zoom],
+            ans2, st2 = _ask_vision_retry(pkey, pmodel, purl, mem_parts + [zoom],
                                           prompt, profiles.ACTIVE.vision_max_tokens)
             if ans2:
                 ans = f"（整图没答出，放大重看）\n{ans2}"
@@ -236,16 +269,32 @@ def do_vision(ui):
         if not ans:                                 # 所有模型整图+放大全空 → 报错收尾
             ans = (f"❌ 视觉模型都没答出来（整图 HTTP {st} / 放大 HTTP {st2}），"
                    f"重按 {profiles.ACTIVE.vision_retry} 截一次或语音问我")
-        if ans and not ans.startswith("❌"):
-            _vis_mem_note(img, ans)                 # 答成才记（含备用救场），答崩不污染记忆
-        ui("vision", ans)
+        with VIS_MEM_LOCK:
+            memory_unchanged = VIS_MEM["generation"] == mem_generation
+        scene_unchanged = (prompt_store is None
+                           or prompt_store.revision == scene_revision)
+        request_current = memory_unchanged and scene_unchanged
+        if ans and not ans.startswith("❌") and request_current:
+            _vis_mem_note(img, ans, mem_generation)  # 答成才记；代号变化则静默拒绝旧回写
+        # 显示事件也在同一把锁里入队：若 Alt+3 先拿到锁，旧结果不入队；若旧结果
+        # 先入队，Alt+3 的 vision_reset 必然排在它后面，最终画面仍保持清空。
+        with VIS_MEM_LOCK:
+            memory_unchanged = VIS_MEM["generation"] == mem_generation
+            current_mem_ans = len(VIS_MEM["ans"])
+            request_current = memory_unchanged and scene_unchanged
+            if request_current:
+                ui("vision", ans)
         log_event({"type": "vision", "ok": bool(ans and not ans.startswith("❌")),
                    "provider": used_tag,            # [2026-09-09] 实际答出的是主还是备用
                    "err": None if (ans and not ans.startswith("❌")) else (ans or "")[:200],
-                   "answer": ans[:2000], "ans_len": len(ans or ""),
-                   "truncated": bool(ans) and len(ans) > 2000,
-                   "mem_imgs": mem_n, "mem_ans": len(VIS_MEM["ans"]),
-                   "api_sec": round(_time.time() - t0, 2)})
+                    "answer": ans[:2000], "ans_len": len(ans or ""),
+                    "truncated": bool(ans) and len(ans) > 2000,
+                    "prompt_scene": scene_id,
+                    "scene_unchanged": scene_unchanged,
+                    "memory_generation": mem_generation,
+                    "displayed": request_current,
+                    "mem_imgs": mem_n, "mem_ans": current_mem_ans,
+                    "api_sec": round(_time.time() - t0, 2)})
     except Exception as e:
         # 2026-09-12 起落盘：原只弹状态栏，静默启动下「识图失败」在日志里零痕迹
         log_event({"type": "vision_error", "err": f"{type(e).__name__}: {e}"[:200]})

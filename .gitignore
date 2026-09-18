@@ -6,4 +6,6 @@ logs/
 *.mp3
 *.png
 window-pos.txt
+prompt-scenes.json
 session-*.jsonl
+interview_tool/assets/fonts/*.ttf

@@ -18,7 +18,6 @@ interview-tool-api.py — 面试实时辅助工具（API 版：不依赖 Claude 
             浏览器有默认行为且部分测评页拦截，P 无页面副作用）
   F4        隐藏/显示答案窗（一键藏，再按恢复）
   F6        手机推送开关（启动常驻开）：答案同步发到 Telegram，屏幕失效时看手机
-  F7        防捕获开关（启动常驻开）：共享屏幕/录屏时答案窗从捕获画面中消失
   F8        提词器模式 ↔ 普通窗（贴摄像头下方小窗+大字自动滚动）
   F9        按住强制解除门控（面试官说话期间你补充/纠正，麦克风全收）
   F10       附注你的回答开关（默认开：你的实际回答拼进下一问给模型参考）
@@ -146,7 +145,16 @@ def _env_get(var):
             for line in f:
                 line = line.strip()
                 if line.startswith(var + "="):
-                    return line.split("=", 1)[1].strip().strip('"').strip("'")
+                    raw = line.split("=", 1)[1].strip()
+                    if not raw:
+                        return ""
+                    if raw[0] in ('"', "'"):
+                        quote = raw[0]
+                        end = raw.find(quote, 1)
+                        if end != -1:
+                            return raw[1:end].strip()
+                        return raw.strip(quote).strip()
+                    return raw.split("#", 1)[0].strip()
     except OSError:
         pass
     return ""
@@ -364,15 +372,17 @@ def clean_display_text(text):
         out.pop()
     return "\n".join(out)
 
-# ---------- 问答 agent：DeepSeek API + 内存对话历史 ----------
+# ---------- 问答 agent：OpenAI 兼容 API + 内存对话历史 ----------
 class ChatAgent:
     """OpenAI 兼容 API 问答。历史保留最近 HISTORY_TURNS 轮（追问承接）；
     作废轮（新语音打断）通过 drop_last_pair 从历史移除。串行调用，锁保护。"""
-    def __init__(self, api_key, model=DEEPSEEK_MODEL, system_prompt=None):
+    def __init__(self, api_key, model=DEEPSEEK_MODEL, system_prompt=None,
+                 base_url=DEEPSEEK_URL):
         import requests
         self.session = requests.Session()
         self.api_key = api_key
         self.model = model
+        self.base_url = base_url
         self.messages = [{"role": "system",
                           "content": system_prompt if system_prompt is not None else SYSTEM_PROMPT}]
         self.lock = threading.Lock()
@@ -384,7 +394,7 @@ class ChatAgent:
         with self.lock:
             self.messages.append({"role": "user", "content": question})
             resp = self.session.post(
-                DEEPSEEK_URL,
+                self.base_url,
                 headers={"Authorization": f"Bearer {self.api_key}",
                          "Content-Type": "application/json"},
                 json={"model": self.model, "messages": self.messages,
@@ -839,7 +849,7 @@ class WavWriter:
         self._w.clear()
 
 # ---------- 防屏幕捕获：SetWindowDisplayAffinity（WDA_EXCLUDEFROMCAPTURE） ----------
-stealth = {"on": os.environ.get("SHOW_WINDOW_IN_CAPTURE") != "1"}   # F7 防捕获状态（常驻开；调试可设 SHOW_WINDOW_IN_CAPTURE=1 关掉防捕获便于截图验证）
+stealth = {"on": True}   # 防捕获固定常驻开启；不提供运行时关闭开关
 ACRYLIC = {"on": False}  # --acrylic 启动参数：磨砂玻璃背景（DWM Acrylic）替代灰色实底。模块级同上
 CHAMELEON = {"on": False}  # --chameleon 启动参数：吸窗口下方屏幕颜色做底板，文字自动深浅（变色龙）
 
@@ -1401,7 +1411,8 @@ def do_vision(ui):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--api-key", default=None, help="DeepSeek API key（默认读 .env DEEPSEEK_API_KEY）")
-    ap.add_argument("--model", default=DEEPSEEK_MODEL)
+    ap.add_argument("--model", default=None,
+                    help="问答模型名（默认随所选后端：DeepSeek 或主视觉模型）")
     ap.add_argument("--no-inject", action="store_true", help="只转写不调 API（测链路）")
     ap.add_argument("--no-window", action="store_true", help="不显示答案窗（纯转写测试）")
     ap.add_argument("--acrylic", action="store_true", help="磨砂玻璃背景（DWM Acrylic）替代灰色实底")
@@ -1420,16 +1431,28 @@ def main():
     ACRYLIC["on"] = args.acrylic   # 模块级标志：答案窗按此决定磨砂玻璃 / 灰色实底
     CHAMELEON["on"] = args.chameleon
 
-    api_key = args.api_key or _env_get("DEEPSEEK_API_KEY")
+    # 问答后端优先级：显式 --api-key / DEEPSEEK_API_KEY → DeepSeek；否则复用
+    # 主识图链路的 key、模型和 URL。视觉模型是多模态模型，也可接收纯文本问题。
+    deepseek_key = args.api_key or _env_get("DEEPSEEK_API_KEY")
+    if deepseek_key:
+        api_key = deepseek_key
+        answer_model = args.model or DEEPSEEK_MODEL
+        answer_url = DEEPSEEK_URL
+        answer_backend = "DeepSeek"
+    else:
+        api_key = _env_get("ARK_API_KEY")
+        answer_model = args.model or _env_get("ARK_VISION_MODEL") or VISION_MODEL
+        answer_url = _env_get("VISION_BASE_URL") or VISION_BASE_URL
+        answer_backend = "识图链路多模态模型"
     if not args.no_inject and not api_key:
-        sys.exit("❌ 缺少 DEEPSEEK_API_KEY：在 .env 加一行或用 --api-key 指定")
-    print(f"🤖 API: {args.model}", flush=True)
+        sys.exit("❌ 缺少问答模型凭证：请填写 DEEPSEEK_API_KEY，或配置识图链路的 ARK_API_KEY")
+    print(f"🤖 问答 API: {answer_backend} / {answer_model}", flush=True)
 
     # 本场日志：logs/session-时间戳.jsonl（重启提词器 = 新一场）
     global LOG_FILENAME
     os.makedirs(LOG_DIR, exist_ok=True)
     LOG_FILENAME = f"session-{time.strftime('%Y%m%d-%H%M%S')}.jsonl"
-    log_event({"type": "session_start", "model": args.model, "no_inject": args.no_inject})
+    log_event({"type": "session_start", "model": answer_model, "no_inject": args.no_inject})
 
     # 崩溃兜底：hidden-start 启动无控制台，任何线程异常都落到 logs/interview-crash.log
     def _crash_hook(etype, val, tb):
@@ -1470,12 +1493,12 @@ def main():
     root = None
     if not args.no_window:
         root = show_answer_window(ui_q)
-        set_capture_excluded(root, stealth["on"])   # 防捕获常驻开：共享/录屏画面里答案窗不可见
+        set_capture_excluded(root, stealth["on"])   # 防捕获常驻开启
 
     agent = None
     if not args.no_inject:
-        agent = ChatAgent(api_key, model=args.model,
-                          system_prompt=build_system_prompt())
+        agent = ChatAgent(api_key, model=answer_model,
+                          system_prompt=build_system_prompt(), base_url=answer_url)
 
     # Telegram 推送（兜底）：答案同步发到手机；token 用主 bot，目标取白名单第一个
     tg_token = _env_get("BOT_TOKEN")
@@ -1851,14 +1874,14 @@ def main():
         print(f"🎙 全程录音落盘: {wav_dir}", flush=True)
 
     # 热键轮询（GetAsyncKeyState：F10 切模式 / F9 临时麦克风 /
-    # F12 隐藏窗口 / F8 提词器模式 / F7 防捕获 / F6 手机推送 / Ctrl+Esc 暂停）
+    # F12 隐藏窗口 / F8 提词器模式 / F6 手机推送 / Ctrl+Esc 暂停）
     VK_F1, VK_F2 = 0x70, 0x71
     VK_F3, VK_F4 = 0x72, 0x73
-    VK_F6, VK_F7, VK_F8, VK_F9, VK_F10 = 0x75, 0x76, 0x77, 0x78, 0x79
+    VK_F6, VK_F8, VK_F9, VK_F10 = 0x75, 0x77, 0x78, 0x79
     VK_ESC, VK_CTRL, VK_Q = 0x1B, 0x11, 0x51
     VK_UP, VK_DOWN = 0x26, 0x28
     hk = {"f10": False, "esc": False, "f4": False, "f8": False,
-          "f7": False, "f6": False, "f1": False, "f2": False, "f3": False,
+          "f6": False, "f1": False, "f2": False, "f3": False,
           "p": False, "f9": False, "up": False, "down": False, "esc_alone": False}
     hidden_state = {"v": False}      # F4 窗口隐藏状态
 
@@ -2004,16 +2027,6 @@ def main():
             elif not f9 and hk["f9"] and not args.manual:
                 event_q.put(("f9_off", None))
             hk["f9"] = f9
-            # F7 防捕获开关：共享屏幕/录屏时答案窗从捕获画面里消失（自己仍照常看）
-            f7 = key_down(VK_F7)
-            if f7 and not hk["f7"]:
-                stealth["on"] = not stealth["on"]
-                if root is not None:
-                    ok = set_capture_excluded(root, stealth["on"])
-                    print(f"🕶️ 防捕获: {'开（共享/录屏画面里答案窗不可见）' if stealth['on'] else '关'}"
-                          + ("" if ok else "（设置失败）"), flush=True)
-                    set_status(("🕶️ 防捕获开" if stealth["on"] else "防捕获关") + " · F7切换")
-            hk["f7"] = f7
             # F6 手机推送开关（兜底渠道，启动常驻开）
             f6 = key_down(VK_F6)
             if f6 and not hk["f6"]:
@@ -2031,20 +2044,20 @@ def main():
 
     threading.Thread(target=hotkey_loop, daemon=True).start()
 
-    # 启动：录音流常开（F1/F2 控制攒与不攒）；防捕获与手机推送已常驻开
+    # 启动：录音流常开（F1/F2 控制攒与不攒）；防捕获与手机推送常驻开
     recorder_loop.start()
     if not args.manual:
         recorder_mic.start()   # 自动模式：麦克风轨常开（门控由编排线程仲裁）
         print("✅ 就绪（自动模式）。双轨全程录音：面试官说话自动断句攒问题，"
               "你开口（或停顿 2.5s）自动发送 → DeepSeek 作答。全程 WAV 落盘可复盘。"
-              "🕶️ 防捕获常驻开，📱 手机推送常驻开（F7/F6 可关）。"
+              "🕶️ 防捕获常驻开，📱 手机推送常驻开（F6 可关）。"
               "F1 手动录问题兜底，F3 识图，F4 隐藏，F8 提词器，"
               "F9 按住强制收录你的话，F10 附注你的回答开关，↑↓ 翻历史，"
               "ESC/Ctrl+Q 退出，Ctrl+Esc 暂停", flush=True)
         set_status("🕶️ 防捕获开 · 📱 推送开 · 自动模式")
     else:
         print("✅ 就绪（手动模式）。F1 开始录音 → 面试官提问 → F2 结束 → 转写提问上屏 → DeepSeek 作答。"
-              "🕶️ 防捕获常驻开，📱 手机推送常驻开（F7/F6 可关）。"
+              "🕶️ 防捕获常驻开，📱 手机推送常驻开（F6 可关）。"
               "F3 识图，F4 隐藏窗口，F8 提词器，F10 全听，↑↓ 翻历史，"
               "ESC/Ctrl+Q 退出，Ctrl+Esc 暂停", flush=True)
         set_status("🕶️ 防捕获开 · 📱 推送开 · 手动模式")
