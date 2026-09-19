@@ -2,7 +2,6 @@
 """Configurable global hotkeys and their runtime actions."""
 from dataclasses import dataclass
 import ctypes
-import os
 import re
 import threading
 import time
@@ -269,7 +268,7 @@ class HotkeyRuntime:
                  state, state_lock, epoch, recorder_loop, recorder_mic,
                  event_q, attach_on, prompt_store, type_answer,
                  paste_answer, do_vision, reset_vision, save_geometry,
-                 manual_handler):
+                 manual_handler, shutdown_event=None):
         self.bindings = bindings
         self.profile_key = profile_key
         self.manual = manual
@@ -290,6 +289,7 @@ class HotkeyRuntime:
         self.reset_vision = reset_vision
         self.save_geometry = save_geometry
         self.manual_handler = manual_handler
+        self.shutdown_event = shutdown_event or threading.Event()
         self.hidden = False
         self.exit_previous = 0.0
         self.prompter_last = 0.0
@@ -308,7 +308,9 @@ class HotkeyRuntime:
         if self.root is not None:
             self.save_geometry(self.root.geometry())
         print(message, flush=True)
-        os._exit(0)
+        self.shutdown_event.set()
+        if self.root is not None:
+            self.ui("quit")
 
     def _after_release(self, action, callback, *args):
         self.bindings.wait_released(action)
@@ -327,7 +329,7 @@ class HotkeyRuntime:
                          args=(self.ui, self.prompt_store), daemon=True).start()
 
     def run(self):
-        while True:
+        while not self.shutdown_event.is_set():
             time.sleep(0.08)
             keys = self.bindings.poll()
 
@@ -390,12 +392,13 @@ class HotkeyRuntime:
                 print(f"🎙️ 开始录音（{self.bindings.label('record_stop')} 结束）", flush=True)
 
             if keys["record_stop"].pressed:
-                bufs = []
+                loop_bufs = []
+                mic_bufs = []
                 if self.recorder_loop:
-                    bufs += self.recorder_loop.stop_rec()
+                    loop_bufs = self.recorder_loop.stop_rec()
                 if self.recorder_mic:
-                    bufs += self.recorder_mic.stop_rec()
-                if not bufs:
+                    mic_bufs = self.recorder_mic.stop_rec()
+                if not loop_bufs and not mic_bufs:
                     self.ui("rec_off")
                     self.ui("status", f"没录到内容（先按 {self.bindings.label('record_start')} 开始录音）")
                     self.ui("idle")
@@ -403,7 +406,7 @@ class HotkeyRuntime:
                 else:
                     self.ui("rec_off")
                     threading.Thread(target=self.manual_handler,
-                                     args=(bufs,), daemon=True).start()
+                                     args=(loop_bufs, mic_bufs), daemon=True).start()
 
             if keys["vision"].pressed:
                 self._start_vision()

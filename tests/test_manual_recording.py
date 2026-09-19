@@ -22,6 +22,9 @@ class _FakePyAudio:
         return {"index": index, "name": "microphone",
                 "defaultSampleRate": 44100, "maxInputChannels": 1}
 
+    def terminate(self):
+        pass
+
 
 class _FakeThread:
     def __init__(self, **_kwargs):
@@ -43,6 +46,9 @@ class ManualRecordingStartupTests(unittest.TestCase):
 
             def start(self):
                 self.start_count += 1
+
+            def stop(self):
+                pass
 
         loop_device = {"name": "loopback", "defaultSampleRate": 48000,
                        "maxInputChannels": 2}

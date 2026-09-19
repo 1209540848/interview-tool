@@ -951,6 +951,8 @@ def show_answer_window(ui_q, prompt_store=None, on_prompt_apply=None,
                     global PENDING_TXT
                     PENDING_TXT = str(payload)
                     render()
+                elif kind == "quit":
+                    root.quit()
             except Exception as e:
                 # 单个事件出错不能杀死整个 poll：记日志继续收下一个
                 log_event({"type": "ui_error", "kind": kind, "err": str(e)[:200]})
@@ -999,7 +1001,10 @@ def load_history_from_logs():
     import glob
     items = []
     try:
-        files = sorted(glob.glob(os.path.join(LOG_DIR, "session-*.jsonl")))
+        # 新格式：每次启动一个独立目录；同时兼容升级前散落在 logs/ 根目录的日志。
+        files = sorted(
+            glob.glob(os.path.join(LOG_DIR, "session-*", "events.jsonl")) +
+            glob.glob(os.path.join(LOG_DIR, "session-*.jsonl")))
     except Exception:
         return items
     for fn in files[-10:]:          # 最近 10 场

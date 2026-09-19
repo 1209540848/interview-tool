@@ -12,7 +12,7 @@ import time
 from .config import _env_get
 from .log import log_event
 from .state import VIS_MEM, VIS_MEM_LOCK, VISION_STATE
-from . import profiles          # quiz/code 问图协议取 ACTIVE；技术场景由 PromptStore 参数注入
+from . import profiles, storage  # quiz/code 问图协议取 ACTIVE；技术场景由 PromptStore 参数注入
 
 # ---------- Alt+P 截屏识图（手撕代码场景：面试官共享屏幕出题 / 笔试 OJ 截图直接出答案） ----------
 # 兼容两家 OpenAI 风格接口，用 .env 三件套切换，不用改代码：
@@ -334,6 +334,7 @@ def do_vision(ui, prompt_store=None):
     答案窗显示。答成记入多轮记忆；识别失败走冗余链路（2026-09-09）：主模型整图失败 →
     放大重试 → 仍失败自动切备用模型（同一份截图与上下文）→ 备用也放大 → 全失败才报错，
     任何时候都不打断主链路"""
+    request_id = None
     try:
         key = _env_get("ARK_API_KEY")
         if not key:
@@ -368,6 +369,14 @@ def do_vision(ui, prompt_store=None):
         else:
             prompt = profiles.ACTIVE.vision_prompt
         prompt += mem_suffix
+        request_id = storage.new_request(
+            "vision", profile=profiles.ACTIVE.key, prompt_scene=scene_id,
+            history_images=mem_n, timeout_sec=timeout_seconds)
+        screenshot_path = storage.save_screenshot(img, request_id=request_id)
+        storage.update_request(
+            request_id, screenshot=screenshot_path, prompt=prompt,
+            providers=[{"tag": tag, "model": model, "url": url}
+                       for tag, _key, model, url in providers])
         stream_state = {"last_emit": 0.0}
 
         def emit_stream(text, prefix=""):
@@ -420,6 +429,10 @@ def do_vision(ui, prompt_store=None):
         request_current = memory_unchanged and scene_unchanged
         if ans and not ans.startswith("❌") and request_current:
             _vis_mem_note(img, ans, mem_generation)  # 答成才记；代号变化则静默拒绝旧回写
+        storage.save_response(
+            request_id, ans, stage="done" if ans and not ans.startswith("❌") else "failed",
+            provider=used_tag, displayed=request_current,
+            api_sec=round(_time.time() - t0, 2))
         # 显示事件也在同一把锁里入队：若 Alt+3 先拿到锁，旧结果不入队；若旧结果
         # 先入队，Alt+3 的 vision_reset 必然排在它后面，最终画面仍保持清空。
         with VIS_MEM_LOCK:
@@ -434,6 +447,8 @@ def do_vision(ui, prompt_store=None):
                     "answer": ans[:2000], "ans_len": len(ans or ""),
                     "truncated": bool(ans) and len(ans) > 2000,
                     "prompt_scene": scene_id,
+                    "request_id": request_id,
+                    "screenshot": screenshot_path,
                     "scene_unchanged": scene_unchanged,
                     "memory_generation": mem_generation,
                     "displayed": request_current,
@@ -443,6 +458,8 @@ def do_vision(ui, prompt_store=None):
     except Exception as e:
         # 2026-09-12 起落盘：原只弹状态栏，静默启动下「识图失败」在日志里零痕迹
         log_event({"type": "vision_error", "err": f"{type(e).__name__}: {e}"[:200]})
+        storage.update_request(request_id, stage="failed",
+                               error=f"{type(e).__name__}: {e}"[:300])
         message = f"❌ 识图异常: {e}"
         ui("vision_abort", message)
         ui("status", message)

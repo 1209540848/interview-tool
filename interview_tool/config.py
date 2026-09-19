@@ -78,3 +78,16 @@ def _env_get(var):
     except OSError:
         pass
     return found
+
+
+def _env_bool(var, default=False):
+    """读取常见布尔配置；空值使用默认值，非法值给出提示后回退。"""
+    raw = _env_get(var).strip().lower()
+    if not raw:
+        return bool(default)
+    if raw in ("1", "true", "yes", "on", "enabled"):
+        return True
+    if raw in ("0", "false", "no", "off", "disabled"):
+        return False
+    print(f"⚠️ {var} 仅支持 true/false，已使用默认值 {bool(default)}", flush=True)
+    return bool(default)

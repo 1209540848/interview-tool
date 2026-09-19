@@ -40,12 +40,14 @@ class Recorder:
       - _raw：原生格式 int16 块（设备采样率/声道原样）→ WavWriter 落盘（复盘要真相）
     callback 只做最小工作：不阻塞、不文件IO、不 print、异常全吞不 return paComplete（不杀流）。
     流常开不关；_rec/_bufs 保留 F1 手动兜底（攒 16k float32 整段）。"""
-    def __init__(self, p, device_idx, device, on_block=None, mode="cb"):
+    def __init__(self, p, device_idx, device, on_block=None, mode="cb",
+                 capture_raw=True):
         self.p = p
         self.device_idx = device_idx
         self.device = device
         self.on_block = on_block
         self.mode = mode
+        self.capture_raw = bool(capture_raw)
         self._stream = None
         self._thread = None
         self._stop = threading.Event()
@@ -160,7 +162,8 @@ class Recorder:
             i16 = np.clip(block * 32767, -32768, 32767).astype(np.int16)
             r16 = resample_to_16k(block, self._sr)
             with self._lock:
-                self._raw.append(i16)
+                if self.capture_raw:
+                    self._raw.append(i16)
                 if self._rec:
                     self._bufs.append(r16)
             if self.on_block is not None:
@@ -253,6 +256,7 @@ class WavWriter:
         self.recorders = recorders      # {label: Recorder}
         self._stop = threading.Event()
         self._w = {}                    # {label: wave.Wave_write}
+        self._io_lock = threading.Lock()
 
     def _ensure(self, label, rec):
         if label in self._w or rec.device is None:
@@ -265,26 +269,35 @@ class WavWriter:
         w.writeframes(b"")              # 写 44 字节空 header 占位
         self._w[label] = w
 
+    def _flush(self):
+        for label, rec in self.recorders.items():
+            self._ensure(label, rec)
+            w = self._w.get(label)
+            if w is None:
+                continue
+            blocks = rec.take_raw()
+            if blocks:
+                w.writeframes(np.concatenate(blocks).tobytes())
+            _patch_wav_size(self.paths[label])
+
     def run(self):
         while not self._stop.wait(WAV_FLUSH_SEC):
             try:
-                for label, rec in self.recorders.items():
-                    self._ensure(label, rec)
-                    w = self._w.get(label)
-                    if w is None:
-                        continue
-                    blocks = rec.take_raw()
-                    if blocks:
-                        w.writeframes(np.concatenate(blocks).tobytes())
-                    _patch_wav_size(self.paths[label])
+                with self._io_lock:
+                    self._flush()
             except Exception:
                 traceback.print_exc()   # writer 异常别吞：报错可排障，线程继续跑
 
     def close(self):
         self._stop.set()
-        for w in list(self._w.values()):
+        with self._io_lock:
             try:
-                w.close()               # close 时 wave 模块自动修正 header
+                self._flush()           # 退出前写完最后一个 5 秒窗口内的原始块
             except Exception:
-                pass
-        self._w.clear()
+                traceback.print_exc()
+            for w in list(self._w.values()):
+                try:
+                    w.close()           # close 时 wave 模块自动修正 header
+                except Exception:
+                    pass
+            self._w.clear()

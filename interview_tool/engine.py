@@ -21,7 +21,7 @@ from threading import Thread
 import numpy as np
 import pyaudiowpatch as pyaudio
 
-from . import log, profiles, typing_code, typing_quiz
+from . import log, profiles, storage, typing_code, typing_quiz
 from .asr import clean_asr_text, transcribe
 from .audio import Recorder, WavWriter, loop_tcp_thread, pick_loopback_device
 from .chat import ChatAgent, DEEPSEEK_MODEL, DEEPSEEK_URL, build_system_prompt
@@ -42,6 +42,37 @@ from .ui import hist, load_history_from_logs, save_window_geometry, \
     show_answer_window
 from .vision import _vis_mem_reset, _vision_providers, do_vision
 from .winfx import set_capture_excluded
+
+
+def _join_audio_blocks(blocks):
+    """把 Recorder 的 float32 块拼成单轨；空输入返回空数组。"""
+    arrays = []
+    for block in blocks or ():
+        if isinstance(block, (bytes, bytearray, memoryview)):
+            arrays.append(np.frombuffer(block, dtype=np.float32))
+        else:
+            arrays.append(np.asarray(block, dtype=np.float32).reshape(-1))
+    return np.concatenate(arrays) if arrays else np.empty(0, dtype=np.float32)
+
+
+def _mix_manual_tracks(loop_blocks, mic_blocks, include_mic=True):
+    """按时间对齐混合手动录音双轨，避免把两条同时录制的声音首尾拼接。"""
+    loop_audio = _join_audio_blocks(loop_blocks)
+    mic_audio = (_join_audio_blocks(mic_blocks) if include_mic
+                 else np.empty(0, dtype=np.float32))
+    if not loop_audio.size:
+        return mic_audio, loop_audio, mic_audio
+    if not mic_audio.size:
+        return loop_audio, loop_audio, mic_audio
+    size = max(loop_audio.size, mic_audio.size)
+    mixed = np.zeros(size, dtype=np.float32)
+    counts = np.zeros(size, dtype=np.float32)
+    mixed[:loop_audio.size] += loop_audio
+    counts[:loop_audio.size] += 1.0
+    mixed[:mic_audio.size] += mic_audio
+    counts[:mic_audio.size] += 1.0
+    mixed /= np.maximum(counts, 1.0)
+    return mixed, loop_audio, mic_audio
 
 
 def main(profile):
@@ -99,7 +130,7 @@ def main(profile):
     if prompt_store.load_error:
         print(f"⚠️ Prompt 场景配置读取失败，已回退默认：{prompt_store.load_error}", flush=True)
 
-    # 本场日志：logs/session-时间戳.jsonl（重启提词器 = 新一场）
+    # 本次启动独占 logs/session-时间-毫秒-p进程号/，事件与所有请求都收在目录内。
     log.start_session(answer_model, args.no_inject)   # R3 注入：原 4 行块（global 声明+建目录+命名+session_start）封装
     log_event({"type": "prompt_scene", "scene_id": active_scene["id"],
                "scene_name": active_scene["name"], "reason": "session_start"})
@@ -128,6 +159,7 @@ def main(profile):
              "paused": False, "tp": False}   # listen=只听 / full=全听 / tp=提词器
     epoch = {"n": 0}            # 每检测到新语音 +1；答案回来时序号不符 → 作废
     st_lock = threading.Lock()
+    shutdown_event = threading.Event()
     ui_q = queue.Queue()
 
     def ui(kind, payload=None):
@@ -174,7 +206,12 @@ def main(profile):
 
     def answer_worker():
         while True:
-            text, seq, trigger = answer_q.get()
+            job = answer_q.get()
+            text, seq, trigger = job[:3]
+            request_id = job[3] if len(job) > 3 else None
+            storage.update_request(request_id, stage="answering", model=answer_model,
+                                   answer_backend=answer_backend, trigger=trigger,
+                                   question=(text if storage.transcripts_enabled() else None))
             t0 = time.time()      # API 耗时（日志复盘用）
             last_ui = {"t": 0.0}
             # 附注你的回答（自动模式）：取尚未附注过的 last_answer，拼进问题末尾
@@ -210,6 +247,8 @@ def main(profile):
             except Exception as e:
                 print(f"❌ API 调用失败: {e}", flush=True)
                 ui("a", f"（API 失败：{e}）")
+                storage.update_request(request_id, stage="failed",
+                                       error=f"{type(e).__name__}: {e}"[:300])
                 continue
             with st_lock:
                 stale = seq != epoch["n"]
@@ -217,12 +256,17 @@ def main(profile):
                 agent.void_last()   # 不删历史：占位保留，追问才有上下文
                 log_event({"type": "void", "question": text,
                            "partial": (answer or "").strip()[:200],
+                           "request_id": request_id,
                            "api_sec": round(time.time() - t0, 2)})
+                storage.save_response(request_id, answer, stage="void")
                 print("🗑️ 答案作废（新语音已到，历史保留）", flush=True)
                 continue
             print(f"💡 答案 ({len(answer)}字)", flush=True)
             log_event({"type": "answer", "question": text, "answer": answer,
+                       "request_id": request_id,
                        "api_sec": round(time.time() - t0, 2)})
+            storage.save_response(request_id, answer, stage="done",
+                                  api_sec=round(time.time() - t0, 2))
             ui("a", answer)
             if push_on["on"]:
                 push_answer(text, answer)
@@ -231,18 +275,40 @@ def main(profile):
         threading.Thread(target=answer_worker, daemon=True).start()
 
     # 手动录音链路（F1 开始攒、F2 结束转写 → 提问上屏 → 生成回答）
-    def _manual_go(bufs):
-        """F2 结束录音后：拼接音频 → 转写 → 提问上屏 → 送 answer_q"""
+    def _manual_go(loop_bufs, mic_bufs):
+        """F2 结束录音后：双轨对齐混音 → 保存 → 转写 → 提问上屏。"""
         try:
-            audio = np.concatenate([np.frombuffer(b, dtype=np.float32) for b in bufs])
+            with st_lock:
+                include_mic = state["mode"] == "full"
+            audio, loop_audio, mic_audio = _mix_manual_tracks(
+                loop_bufs, mic_bufs, include_mic=include_mic)
         except Exception as e:
             print(f"❌ 音频拼接失败: {e}", flush=True)
             ui("idle")
             return
+        if not audio.size:
+            ui("status", "没录到内容，可重录")
+            ui("idle")
+            return
+        request_id = storage.new_request(
+            "manual-question", mode="full" if include_mic else "listen")
+        loop_path = storage.save_audio_clip(
+            loop_audio, "loop", request_id=request_id)
+        mic_path = storage.save_audio_clip(
+            mic_audio, "mic", request_id=request_id)
+        if loop_path and not mic_audio.size:
+            audio_path = loop_path
+        elif mic_path and not loop_audio.size:
+            audio_path = mic_path
+        else:
+            audio_path = storage.save_audio_clip(
+                audio, "input", request_id=request_id)
         try:
             text = transcribe(audio)
         except Exception as e:
             print(f"❌ 转写出错: {e}", flush=True)
+            storage.update_request(request_id, stage="failed",
+                                   error=f"{type(e).__name__}: {e}"[:300])
             ui("status", f"❌ 转写出错: {e}")
             ui("idle")
             return
@@ -253,14 +319,19 @@ def main(profile):
             ui("idle")
             return
         print(f"✍️ 转写: {text}", flush=True)
+        storage.save_transcript(
+            "manual_question", text, request_id=request_id, audio=audio_path,
+            loop_audio=loop_path, mic_audio=mic_path,
+            duration_sec=round(len(audio) / SAMPLE_RATE, 2))
         with st_lock:
             seq = epoch["n"]
-        log_event({"type": "question", "source": "手动", "text": text, "seq": seq})
+        log_event({"type": "question", "source": "手动", "text": text,
+                   "seq": seq, "audio": audio_path, "request_id": request_id})
         ui("q", text)                       # 提问先上屏（用户先确认录到了什么）
         if args.no_inject:
             print(f"🔇 [no-inject] {text}", flush=True)
             return
-        answer_q.put((text, seq, "manual"))
+        answer_q.put((text, seq, "manual", request_id))
 
     # ---------- 自动模式链路（默认）：双轨常开 + 门控 + 编排线程 ----------
     # 两个 PortAudio callback 只发事件（event_q），门控仲裁/VAD/双触发/作废全在编排线程串行。
@@ -411,12 +482,19 @@ def main(profile):
             while True:
                 job = tq.get()
                 kind = job[0]
+                request_kind = "auto-question" if kind == "q" else "auto-my-answer"
+                request_id = storage.new_request(
+                    request_kind, trigger=job[2] if kind == "q" else None)
+                audio_path = storage.save_audio_clip(
+                    job[1], "input", request_id=request_id)
                 try:
                     if kind == "q":
                         text = transcribe(job[1])
                     else:
                         text = transcribe(job[1])   # 增量小批（≤MY_BATCH_SEC 音频），无需短超时
                 except Exception as e:
+                    storage.update_request(request_id, stage="failed",
+                                           error=f"{type(e).__name__}: {e}"[:300])
                     log_event({"type": "transcribe_fail", "kind": kind, "err": str(e)[:200]})
                     if kind == "q":
                         print(f"❌ 问题转写出错: {e}", flush=True)
@@ -429,22 +507,31 @@ def main(profile):
                         ui("status", "没识别到有效语音")
                     continue
                 if kind == "q":
+                    storage.save_transcript(
+                        "interviewer", text, request_id=request_id,
+                        audio=audio_path, trigger=job[2],
+                        duration_sec=round(len(job[1]) / SAMPLE_RATE, 2))
                     with st_lock:
                         seq = epoch["n"]   # 采样点：转写完成、入队前（触发时取会误作废新问题）
                     log_event({"type": "question_auto", "trigger": job[2],
                                "text": text[:300], "seq": seq,
+                               "audio": audio_path, "request_id": request_id,
                                "audio_sec": round(len(job[1]) / SAMPLE_RATE, 1)})
                     print(f"✍️ 问题（{job[2]}）: {text}", flush=True)
                     ui("q", text)
-                    answer_q.put((text, seq, job[2]))
+                    answer_q.put((text, seq, job[2], request_id))
                 else:
+                    storage.save_transcript(
+                        "me", text, request_id=request_id, audio=audio_path,
+                        duration_sec=round(len(job[1]) / SAMPLE_RATE, 2))
                     with ans_lock:
                         # 增量累积：边讲边进上下文；保留最近 MY_ANSWER_TEXT_MAX 字（超出丢最旧）
                         last_answer["text"] = (last_answer["text"] + " " + text).strip()
                         if len(last_answer["text"]) > MY_ANSWER_TEXT_MAX:
                             last_answer["text"] = last_answer["text"][-MY_ANSWER_TEXT_MAX:]
                         last_answer["attached"] = False
-                    log_event({"type": "my_answer", "text": text[:300]})
+                    log_event({"type": "my_answer", "text": text[:300],
+                               "request_id": request_id, "audio": audio_path})
                     print(f"🗣 你的回答: {text[:60]}{'…' if len(text) > 60 else ''}", flush=True)
                     ui("my_answer", text)
 
@@ -488,10 +575,13 @@ def main(profile):
 
     # 自动模式：回环轨 read 线程（VB-Audio 驱动 callback 全损 0/NaN，read() 才正常）、
     # 或 TCP 直连（面试官音频不走声卡）、麦克风轨 callback（真麦克风正常）发事件给编排线程
+    capture_raw = not args.manual and storage.audio_enabled()
     recorder_loop = Recorder(p, loop_idx, loop_dev, mode="tcp" if args.loop_tcp else "read",
+                             capture_raw=capture_raw,
                              on_block=(lambda b, r: event_q.put(("loop_audio", (b, r))))
                              if not args.manual else None)
     recorder_mic = Recorder(p, mic_idx, mic_dev,
+                            capture_raw=capture_raw,
                             on_block=(lambda b, r: event_q.put(("mic_audio", (b, r))))
                             if not args.manual else None)
     if args.loop_tcp:
@@ -500,9 +590,8 @@ def main(profile):
 
     # 全程录音落盘（复盘）：双轨原始 WAV，独立线程每 5s 刷盘 + 修补 header
     wav_writer = None
-    if not args.manual:
-        wav_dir = os.path.join(LOG_DIR, log.LOG_FILENAME[:-6] if log.LOG_FILENAME.endswith(".jsonl") else "rec")
-        os.makedirs(wav_dir, exist_ok=True)
+    if not args.manual and storage.audio_enabled():
+        wav_dir = storage.ensure_dir("audio")
         wav_writer = WavWriter(
             {"interviewer": os.path.join(wav_dir, "interviewer.wav"),
              "me": os.path.join(wav_dir, "me.wav")},
@@ -521,31 +610,40 @@ def main(profile):
         prompt_store=prompt_store, type_answer=type_answer_into_foreground,
         paste_answer=paste_answer_into_foreground, do_vision=do_vision,
         reset_vision=_vis_mem_reset, save_geometry=save_window_geometry,
-        manual_handler=_manual_go,
+        manual_handler=_manual_go, shutdown_event=shutdown_event,
     )
     threading.Thread(target=hotkey_runtime.run, daemon=True).start()
 
     # 启动：录音流常开（F1/F2 控制攒与不攒）；防捕获与手机推送常驻开
-    recorder_loop.start()
-    if recorder_mic:
-        recorder_mic.start()   # 自动模式常开；手动模式默认全听，F1/F2 同时收两轨
-    print(hotkeys.banner(args.manual), flush=True)
-    if not args.manual:
-        set_status("🕶️ 防捕获开 · 📱 推送开 · 自动模式")
-    else:
-        set_status("🕶️ 防捕获开 · 📱 推送开 · 手动全听模式 · "
-                   f"{hotkeys.label('toggle_mode')}切换")
-    print("=" * 50, flush=True)
+    try:
+        recorder_loop.start()
+        if recorder_mic:
+            recorder_mic.start()   # 自动模式常开；手动模式默认全听，F1/F2 同时收两轨
+        print(hotkeys.banner(args.manual), flush=True)
+        if not args.manual:
+            set_status("🕶️ 防捕获开 · 📱 推送开 · 自动模式")
+        else:
+            set_status("🕶️ 防捕获开 · 📱 推送开 · 手动全听模式 · "
+                       f"{hotkeys.label('toggle_mode')}切换")
+        print("=" * 50, flush=True)
 
-    if root is not None:
-        root.mainloop()
-    else:
+        if root is not None:
+            root.mainloop()
+        else:
+            try:
+                while not shutdown_event.wait(1.0):
+                    pass
+            except KeyboardInterrupt:
+                pass
+    finally:
+        if not shutdown_event.is_set():
+            log_event({"type": "session_end", "reason": "正常退出"})
+        recorder_loop.stop()
+        if recorder_mic:
+            recorder_mic.stop()
+        if wav_writer is not None:
+            wav_writer.close()
         try:
-            while True:
-                time.sleep(1)
-        except KeyboardInterrupt:
+            p.terminate()
+        except Exception:
             pass
-    log_event({"type": "session_end", "reason": "正常退出"})
-    recorder_loop.stop()
-    if recorder_mic:
-        recorder_mic.stop()

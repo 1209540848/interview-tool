@@ -1,6 +1,11 @@
+import os
+import tempfile
 import unittest
+import wave
 
-from interview_tool.audio import Recorder
+import numpy as np
+
+from interview_tool.audio import Recorder, WavWriter
 
 
 class _FakeStream:
@@ -35,6 +40,35 @@ class RecorderRestartTests(unittest.TestCase):
         self.assertFalse(recorder._stop.is_set())
         self.assertEqual(audio.open_count, 2)
         self.assertIsNotNone(recorder._stream)
+
+    def test_capture_raw_false_does_not_accumulate_unconsumed_audio(self):
+        device = {"defaultSampleRate": 16000, "maxInputChannels": 1}
+        recorder = Recorder(None, 1, device, mode="read", capture_raw=False)
+        recorder._sr = 16000
+        recorder._ch = 1
+        recorder._process(np.array([100, -100], dtype=np.int16).tobytes())
+
+        self.assertEqual(recorder.take_raw(), [])
+
+
+class WavWriterTests(unittest.TestCase):
+    def test_close_flushes_pending_blocks(self):
+        class FakeRecorder:
+            device = {"defaultSampleRate": 16000}
+
+            def __init__(self):
+                self.blocks = [np.array([1, 2, 3], dtype=np.int16)]
+
+            def take_raw(self):
+                blocks, self.blocks = self.blocks, []
+                return blocks
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "voice.wav")
+            writer = WavWriter({"voice": path}, {"voice": FakeRecorder()})
+            writer.close()
+            with wave.open(path, "rb") as handle:
+                self.assertEqual(handle.getnframes(), 3)
 
 
 if __name__ == "__main__":

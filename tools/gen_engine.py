@@ -16,6 +16,7 @@ engine.py = code 版主逻辑（行为主本）+ 登记点编辑：
   (j) 移除 F7 防捕获开关；防捕获由 state 固定常驻开启
   (k) 注入单活动 PromptStore：设置窗口切场景、语音下一题换 system、截图按场景快照
   (l) 硬编码热键轮询替换为 HotkeyBindings / HotkeyRuntime（.env 可重绑）
+  (m) 会话数据归档、手动双轨对齐混音与安全退出清理
 
 所有点编辑的缩进一律从锚点行推导（不硬编码列号）；每个编辑的目标文本都做内容断言，
 源文件漂移即中止 → 生成器可放心重跑。引擎自身除 profile.key 分叉外零场景判断——
@@ -276,6 +277,14 @@ def main():
             raise SystemExit(f"body 锚 '{key[:60]}' 命中 {len(hits)} 处（期望 1）")
         return hits[0]
 
+    def body_find_seq(sequence):
+        """返回一段连续文本在 body 中的起点；必须恰好命中一次。"""
+        hits = [i for i in range(len(body) - len(sequence) + 1)
+                if body[i:i + len(sequence)] == sequence]
+        if len(hits) != 1:
+            raise SystemExit(f"body 连续锚 '{sequence[0][:60]}' 命中 {len(hits)} 处（期望 1）")
+        return hits[0]
+
     p_api = body_find('print(f"🤖 问答 API: {answer_backend} / {answer_model}"') + 1
     body[p_api:p_api] = [
         "    active_scene = prompt_store.get_active_scene()",
@@ -284,6 +293,7 @@ def main():
         "        print(f\"⚠️ Prompt 场景配置读取失败，已回退默认：{prompt_store.load_error}\", flush=True)",
     ]
     p_log = body_find("log.start_session(answer_model, args.no_inject)") + 1
+    body[p_log - 2] = "    # 本次启动独占 logs/session-时间-毫秒-p进程号/，事件与所有请求都收在目录内。"
     body[p_log:p_log] = [
         '    log_event({"type": "prompt_scene", "scene_id": active_scene["id"],',
         '               "scene_name": active_scene["name"], "reason": "session_start"})',
@@ -402,6 +412,223 @@ def main():
         '                   f"{hotkeys.label(\'toggle_mode\')}切换")',
     ]
 
+    # (m) 会话数据归档：截图由 vision 保存；引擎保存每次 ASR 音频片段与转录。
+    lock_line = body_find("    st_lock = threading.Lock()") + 1
+    body[lock_line:lock_line] = ["    shutdown_event = threading.Event()"]
+
+    answer_job = body_find("            text, seq, trigger = answer_q.get()")
+    body[answer_job:answer_job + 1] = [
+        "            job = answer_q.get()",
+        "            text, seq, trigger = job[:3]",
+        "            request_id = job[3] if len(job) > 3 else None",
+        '            storage.update_request(request_id, stage="answering", model=answer_model,',
+        "                                   answer_backend=answer_backend, trigger=trigger,",
+        "                                   question=(text if storage.transcripts_enabled() else None))",
+    ]
+    answer_error = body_find_seq([
+        '                ui("a", f"（API 失败：{e}）")',
+        "                continue",
+    ])
+    body[answer_error + 1:answer_error + 1] = [
+        '                storage.update_request(request_id, stage="failed",',
+        '                                       error=f"{type(e).__name__}: {e}"[:300])',
+    ]
+    void_log = body_find_seq([
+        '                log_event({"type": "void", "question": text,',
+        '                           "partial": (answer or "").strip()[:200],',
+        '                           "api_sec": round(time.time() - t0, 2)})',
+    ])
+    body[void_log:void_log + 3] = [
+        '                log_event({"type": "void", "question": text,',
+        '                           "partial": (answer or "").strip()[:200],',
+        '                           "request_id": request_id,',
+        '                           "api_sec": round(time.time() - t0, 2)})',
+        '                storage.save_response(request_id, answer, stage="void")',
+    ]
+    answer_log = body_find_seq([
+        '            log_event({"type": "answer", "question": text, "answer": answer,',
+        '                       "api_sec": round(time.time() - t0, 2)})',
+    ])
+    body[answer_log:answer_log + 2] = [
+        '            log_event({"type": "answer", "question": text, "answer": answer,',
+        '                       "request_id": request_id,',
+        '                       "api_sec": round(time.time() - t0, 2)})',
+        '            storage.save_response(request_id, answer, stage="done",',
+        '                                  api_sec=round(time.time() - t0, 2))',
+    ]
+
+    manual_head = body_find("    def _manual_go(bufs):")
+    manual_tail = body_find('        answer_q.put((text, seq, "manual"))') + 1
+    manual_block = '''    def _manual_go(loop_bufs, mic_bufs):
+        """F2 结束录音后：双轨对齐混音 → 保存 → 转写 → 提问上屏。"""
+        try:
+            with st_lock:
+                include_mic = state["mode"] == "full"
+            audio, loop_audio, mic_audio = _mix_manual_tracks(
+                loop_bufs, mic_bufs, include_mic=include_mic)
+        except Exception as e:
+            print(f"❌ 音频拼接失败: {e}", flush=True)
+            ui("idle")
+            return
+        if not audio.size:
+            ui("status", "没录到内容，可重录")
+            ui("idle")
+            return
+        request_id = storage.new_request(
+            "manual-question", mode="full" if include_mic else "listen")
+        loop_path = storage.save_audio_clip(
+            loop_audio, "loop", request_id=request_id)
+        mic_path = storage.save_audio_clip(
+            mic_audio, "mic", request_id=request_id)
+        if loop_path and not mic_audio.size:
+            audio_path = loop_path
+        elif mic_path and not loop_audio.size:
+            audio_path = mic_path
+        else:
+            audio_path = storage.save_audio_clip(
+                audio, "input", request_id=request_id)
+        try:
+            text = transcribe(audio)
+        except Exception as e:
+            print(f"❌ 转写出错: {e}", flush=True)
+            storage.update_request(request_id, stage="failed",
+                                   error=f"{type(e).__name__}: {e}"[:300])
+            ui("status", f"❌ 转写出错: {e}")
+            ui("idle")
+            return
+        text = clean_asr_text(text or "")
+        if not text:
+            print("🔇 没识别到有效语音（环境声已丢弃）", flush=True)
+            ui("status", "没识别到有效语音，可重录")
+            ui("idle")
+            return
+        print(f"✍️ 转写: {text}", flush=True)
+        storage.save_transcript(
+            "manual_question", text, request_id=request_id, audio=audio_path,
+            loop_audio=loop_path, mic_audio=mic_path,
+            duration_sec=round(len(audio) / SAMPLE_RATE, 2))
+        with st_lock:
+            seq = epoch["n"]
+        log_event({"type": "question", "source": "手动", "text": text,
+                   "seq": seq, "audio": audio_path, "request_id": request_id})
+        ui("q", text)
+        if args.no_inject:
+            print(f"🔇 [no-inject] {text}", flush=True)
+            return
+        answer_q.put((text, seq, "manual", request_id))'''.splitlines()
+    body[manual_head:manual_tail] = manual_block
+
+    job_kind = body_find("                kind = job[0]") + 1
+    body[job_kind:job_kind] = [
+        '                request_kind = "auto-question" if kind == "q" else "auto-my-answer"',
+        "                request_id = storage.new_request(",
+        '                    request_kind, trigger=job[2] if kind == "q" else None)',
+        "                audio_path = storage.save_audio_clip(",
+        '                    job[1], "input", request_id=request_id)',
+    ]
+    transcribe_error = body_find('                    log_event({"type": "transcribe_fail", "kind": kind, "err": str(e)[:200]})')
+    body[transcribe_error:transcribe_error] = [
+        '                    storage.update_request(request_id, stage="failed",',
+        '                                           error=f"{type(e).__name__}: {e}"[:300])',
+    ]
+    question_branch = body_find_seq([
+        '                if kind == "q":',
+        "                    with st_lock:",
+        '                        seq = epoch["n"]   # 采样点：转写完成、入队前（触发时取会误作废新问题）',
+    ])
+    body[question_branch + 1:question_branch + 1] = [
+        "                    storage.save_transcript(",
+        '                        "interviewer", text, request_id=request_id,',
+        '                        audio=audio_path, trigger=job[2],',
+        "                        duration_sec=round(len(job[1]) / SAMPLE_RATE, 2))",
+    ]
+    audio_sec_line = body_find('                               "audio_sec": round(len(job[1]) / SAMPLE_RATE, 1)})')
+    body[audio_sec_line:audio_sec_line + 1] = [
+        '                               "audio": audio_path, "request_id": request_id,',
+        '                               "audio_sec": round(len(job[1]) / SAMPLE_RATE, 1)})',
+    ]
+    my_branch = body_find_seq([
+        "                else:",
+        "                    with ans_lock:",
+        "                        # 增量累积：边讲边进上下文；保留最近 MY_ANSWER_TEXT_MAX 字（超出丢最旧）",
+    ])
+    body[my_branch + 1:my_branch + 1] = [
+        "                    storage.save_transcript(",
+        '                        "me", text, request_id=request_id, audio=audio_path,',
+        "                        duration_sec=round(len(job[1]) / SAMPLE_RATE, 2))",
+    ]
+    q_put = body_find('                    answer_q.put((text, seq, job[2]))')
+    body[q_put] = '                    answer_q.put((text, seq, job[2], request_id))'
+    my_log = body_find('                    log_event({"type": "my_answer", "text": text[:300]})')
+    body[my_log:my_log + 1] = [
+        '                    log_event({"type": "my_answer", "text": text[:300],',
+        '                               "request_id": request_id, "audio": audio_path})',
+    ]
+
+    rec_head = body_find('    recorder_loop = Recorder(p, loop_idx, loop_dev, mode="tcp" if args.loop_tcp else "read",')
+    rec_tail = body_find_seq([
+        "    recorder_mic = Recorder(p, mic_idx, mic_dev,",
+        '                            on_block=(lambda b, r: event_q.put(("mic_audio", (b, r))))',
+        "                            if not args.manual else None)",
+    ]) + 3
+    body[rec_head:rec_tail] = '''    capture_raw = not args.manual and storage.audio_enabled()
+    recorder_loop = Recorder(p, loop_idx, loop_dev, mode="tcp" if args.loop_tcp else "read",
+                             capture_raw=capture_raw,
+                             on_block=(lambda b, r: event_q.put(("loop_audio", (b, r))))
+                             if not args.manual else None)
+    recorder_mic = Recorder(p, mic_idx, mic_dev,
+                            capture_raw=capture_raw,
+                            on_block=(lambda b, r: event_q.put(("mic_audio", (b, r))))
+                            if not args.manual else None)'''.splitlines()
+
+    wav_dir_line = body_find("        wav_dir = os.path.join(LOG_DIR, log.LOG_FILENAME[:-6] if log.LOG_FILENAME.endswith(\".jsonl\") else \"rec\")")
+    assert body[wav_dir_line - 1] == "    if not args.manual:"
+    assert body[wav_dir_line + 1] == "        os.makedirs(wav_dir, exist_ok=True)"
+    body[wav_dir_line - 1:wav_dir_line + 2] = [
+        "    if not args.manual and storage.audio_enabled():",
+        '        wav_dir = storage.ensure_dir("audio")',
+    ]
+
+    handler_line = body_find("        manual_handler=_manual_go,")
+    body[handler_line:handler_line + 1] = [
+        "        manual_handler=_manual_go, shutdown_event=shutdown_event,",
+    ]
+
+    final_head = body_find("    # 启动：录音流常开（F1/F2 控制攒与不攒）；防捕获与手机推送常驻开")
+    body[final_head:] = '''    # 启动：录音流常开（F1/F2 控制攒与不攒）；防捕获与手机推送常驻开
+    try:
+        recorder_loop.start()
+        if recorder_mic:
+            recorder_mic.start()   # 自动模式常开；手动模式默认全听，F1/F2 同时收两轨
+        print(hotkeys.banner(args.manual), flush=True)
+        if not args.manual:
+            set_status("🕶️ 防捕获开 · 📱 推送开 · 自动模式")
+        else:
+            set_status("🕶️ 防捕获开 · 📱 推送开 · 手动全听模式 · "
+                       f"{hotkeys.label('toggle_mode')}切换")
+        print("=" * 50, flush=True)
+
+        if root is not None:
+            root.mainloop()
+        else:
+            try:
+                while not shutdown_event.wait(1.0):
+                    pass
+            except KeyboardInterrupt:
+                pass
+    finally:
+        if not shutdown_event.is_set():
+            log_event({"type": "session_end", "reason": "正常退出"})
+        recorder_loop.stop()
+        if recorder_mic:
+            recorder_mic.stop()
+        if wav_writer is not None:
+            wav_writer.close()
+        try:
+            p.terminate()
+        except Exception:
+            pass'''.splitlines()
+
     PRELUDE = '''# -*- coding: utf-8 -*-
 """engine.py — 统一编排主本（quiz 测评版 / code 笔试版共享一份 main）。
 
@@ -425,7 +652,7 @@ from threading import Thread
 import numpy as np
 import pyaudiowpatch as pyaudio
 
-from . import log, profiles, typing_code, typing_quiz
+from . import log, profiles, storage, typing_code, typing_quiz
 from .asr import clean_asr_text, transcribe
 from .audio import Recorder, WavWriter, loop_tcp_thread, pick_loopback_device
 from .chat import ChatAgent, DEEPSEEK_MODEL, DEEPSEEK_URL, build_system_prompt
@@ -446,6 +673,37 @@ from .ui import hist, load_history_from_logs, save_window_geometry, \\
     show_answer_window
 from .vision import _vis_mem_reset, _vision_providers, do_vision
 from .winfx import set_capture_excluded
+
+
+def _join_audio_blocks(blocks):
+    """把 Recorder 的 float32 块拼成单轨；空输入返回空数组。"""
+    arrays = []
+    for block in blocks or ():
+        if isinstance(block, (bytes, bytearray, memoryview)):
+            arrays.append(np.frombuffer(block, dtype=np.float32))
+        else:
+            arrays.append(np.asarray(block, dtype=np.float32).reshape(-1))
+    return np.concatenate(arrays) if arrays else np.empty(0, dtype=np.float32)
+
+
+def _mix_manual_tracks(loop_blocks, mic_blocks, include_mic=True):
+    """按时间对齐混合手动录音双轨，避免把两条同时录制的声音首尾拼接。"""
+    loop_audio = _join_audio_blocks(loop_blocks)
+    mic_audio = (_join_audio_blocks(mic_blocks) if include_mic
+                 else np.empty(0, dtype=np.float32))
+    if not loop_audio.size:
+        return mic_audio, loop_audio, mic_audio
+    if not mic_audio.size:
+        return loop_audio, loop_audio, mic_audio
+    size = max(loop_audio.size, mic_audio.size)
+    mixed = np.zeros(size, dtype=np.float32)
+    counts = np.zeros(size, dtype=np.float32)
+    mixed[:loop_audio.size] += loop_audio
+    counts[:loop_audio.size] += 1.0
+    mixed[:mic_audio.size] += mic_audio
+    counts[:mic_audio.size] += 1.0
+    mixed /= np.maximum(counts, 1.0)
+    return mixed, loop_audio, mic_audio
 '''
 
     content = PRELUDE + "\n\n" + "\n".join(body) + "\n"
