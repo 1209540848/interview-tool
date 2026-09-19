@@ -108,6 +108,7 @@ def main():
         select_pad + "# 主识图链路的 key、模型和 URL。视觉模型是多模态模型，也可接收纯文本问题。",
         select_pad + 'deepseek_key = args.api_key or _env_get("DEEPSEEK_API_KEY")',
         select_pad + '_vision_tag, vision_key, vision_model, vision_url = _vision_providers()[0]',
+        select_pad + "answer_thinking = None",
         select_pad + "if deepseek_key:",
         select_pad + "    api_key = deepseek_key",
         select_pad + "    answer_model = args.model or DEEPSEEK_MODEL",
@@ -118,6 +119,7 @@ def main():
         select_pad + "    answer_model = args.model or vision_model",
         select_pad + "    answer_url = vision_url",
         select_pad + '    answer_backend = "识图链路多模态模型"',
+        select_pad + '    answer_thinking = _env_get("ANSWER_THINKING")',
         select_pad + "if not args.no_inject and not api_key:",
         select_pad + '    sys.exit("❌ 缺少问答模型凭证：请填写 DEEPSEEK_API_KEY，或配置识图链路的 ARK_API_KEY")',
         select_pad + 'print(f"🤖 问答 API: {answer_backend} / {answer_model}", flush=True)',
@@ -128,7 +130,8 @@ def main():
     agent_pad = " " * ind_of(code_l[agent_head - 1])
     edits.append((agent_head, agent_head + 1, [
         agent_pad + "agent = ChatAgent(api_key, model=answer_model,",
-        agent_pad + "                  system_prompt=build_system_prompt(), base_url=answer_url)",
+        agent_pad + "                  system_prompt=build_system_prompt(), base_url=answer_url,",
+        agent_pad + "                  thinking=answer_thinking)",
     ]))
 
     # (j) 防捕获固定常驻开启：释放 F7，不生成按键常量、状态槽和切换逻辑。
@@ -312,7 +315,8 @@ def main():
         "",
         "    if not args.no_inject:",
         "        agent = ChatAgent(api_key, model=answer_model,",
-        "                          system_prompt=build_system_prompt(prompt_store), base_url=answer_url)",
+        "                          system_prompt=build_system_prompt(prompt_store), base_url=answer_url,",
+        "                          thinking=answer_thinking)",
     ]
     vision_calls = [i for i, line in enumerate(body)
                     if "threading.Thread(target=do_vision, args=(ui,)," in line]

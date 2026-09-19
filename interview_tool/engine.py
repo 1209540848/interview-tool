@@ -77,6 +77,7 @@ def main(profile):
     # 主识图链路的 key、模型和 URL。视觉模型是多模态模型，也可接收纯文本问题。
     deepseek_key = args.api_key or _env_get("DEEPSEEK_API_KEY")
     _vision_tag, vision_key, vision_model, vision_url = _vision_providers()[0]
+    answer_thinking = None
     if deepseek_key:
         api_key = deepseek_key
         answer_model = args.model or DEEPSEEK_MODEL
@@ -87,6 +88,7 @@ def main(profile):
         answer_model = args.model or vision_model
         answer_url = vision_url
         answer_backend = "识图链路多模态模型"
+        answer_thinking = _env_get("ANSWER_THINKING")
     if not args.no_inject and not api_key:
         sys.exit("❌ 缺少问答模型凭证：请填写 DEEPSEEK_API_KEY，或配置识图链路的 ARK_API_KEY")
     print(f"🤖 问答 API: {answer_backend} / {answer_model}", flush=True)
@@ -158,7 +160,8 @@ def main(profile):
 
     if not args.no_inject:
         agent = ChatAgent(api_key, model=answer_model,
-                          system_prompt=build_system_prompt(prompt_store), base_url=answer_url)
+                          system_prompt=build_system_prompt(prompt_store), base_url=answer_url,
+                          thinking=answer_thinking)
 
     # 问答工作线程（串行调 API；答案作废判定靠 epoch 序号）
     # 警告：严禁并行化！void_last 替换 messages 最后一条 assistant 依赖串行顺序，

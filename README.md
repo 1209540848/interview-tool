@@ -63,7 +63,9 @@ Ctrl+Esc  紧急暂停     ESC×2 或 Ctrl+Q  退出
 复制 `.env.example` 为 `.env` 并填入：
 
 - `ARK_API_KEY` / `ARK_VISION_MODEL` / `VISION_BASE_URL` — 识图视觉模型（OpenAI 兼容）
+- `VISION_THINKING` — 截图识图模型的思考模式：`enabled` / `disabled` / `auto`
 - `DEEPSEEK_API_KEY` — 可选；配置后语音问答使用 DeepSeek，留空则复用上述主视觉模型
+- `ANSWER_THINKING` — 语音问答复用视觉模型时的思考模式：`enabled` / `disabled` / `auto`
 - `BOT_TOKEN` / `ALLOWED_IDS` / `PROXY` — Telegram 推送
 - `ISI_APPKEY` / `ALIYUN_AK_ID` / `ALIYUN_AK_SECRET` / `DASHSCOPE_API_KEY` — 转写/备用 ASR（可选）
 

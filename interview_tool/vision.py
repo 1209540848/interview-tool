@@ -158,6 +158,9 @@ def _ask_vision_multi(key, model, url, parts, prompt, max_tokens):
              "image_url": {"url": f"data:image/jpeg;base64,{b}"}} for b in b64s]
     body = {"model": model, "messages": [{"role": "user",
             "content": imgs + [{"type": "text", "text": prompt}]}], "max_tokens": max_tokens}
+    thinking = (_env_get("VISION_THINKING") or "").lower()
+    if thinking in ("enabled", "disabled", "auto"):
+        body["thinking"] = {"type": thinking}
     # 超时 (15, 120)：多轮记忆大请求 + 新模型首 token 慢，60s 单值实测被
     # HTTPConnectionPool 超时打爆（2026-09-12 用户高频复现）——对齐 chat.py 写法
     r = requests.post(url, headers=hdr, json=body, timeout=(15, 120))
@@ -168,6 +171,8 @@ def _ask_vision_multi(key, model, url, parts, prompt, max_tokens):
             [{"type": "input_image",
               "image_url": f"data:image/jpeg;base64,{b}"} for b in b64s] +
             [{"type": "input_text", "text": prompt}]}]}
+        if thinking in ("enabled", "disabled", "auto"):
+            body2["thinking"] = {"type": thinking}
         r2 = requests.post(VISION_FALLBACK_URL, headers=hdr, json=body2, timeout=(15, 120))
         if r2.status_code == 200:
             return _vision_parse(r2.json()), 200

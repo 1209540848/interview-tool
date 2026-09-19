@@ -18,12 +18,17 @@ class AnswerBackendSelectionTests(unittest.TestCase):
         captured = {}
 
         class CapturingAgent:
-            def __init__(self, api_key, model, system_prompt, base_url):
-                captured.update(api_key=api_key, model=model, base_url=base_url)
+            def __init__(self, api_key, model, system_prompt, base_url, thinking=None):
+                captured.update(api_key=api_key, model=model, base_url=base_url,
+                                thinking=thinking)
                 raise _SelectionCaptured
 
         def fake_env_get(name):
-            return deepseek_key if name == "DEEPSEEK_API_KEY" else ""
+            if name == "DEEPSEEK_API_KEY":
+                return deepseek_key
+            if name == "ANSWER_THINKING":
+                return "disabled"
+            return ""
 
         with patch.object(sys, "argv", ["run_code.py", "--no-window"]), \
              patch.object(engine, "_env_get", side_effect=fake_env_get), \
@@ -45,6 +50,7 @@ class AnswerBackendSelectionTests(unittest.TestCase):
             "api_key": "deepseek-key",
             "model": DEEPSEEK_MODEL,
             "base_url": DEEPSEEK_URL,
+            "thinking": None,
         })
 
     def test_visual_backend_is_used_without_deepseek_key(self):
@@ -53,6 +59,7 @@ class AnswerBackendSelectionTests(unittest.TestCase):
             "api_key": "vision-key",
             "model": "vision-model",
             "base_url": "https://vision.example/chat/completions",
+            "thinking": "disabled",
         })
 
 
@@ -82,6 +89,30 @@ class ChatAgentEndpointTests(unittest.TestCase):
         self.assertEqual(agent.ask_stream("question"), "ok")
         self.assertEqual(requested["url"], "https://vision.example/chat/completions")
         self.assertEqual(requested["kwargs"]["json"]["model"], "vision-model")
+
+    def test_optional_thinking_setting_is_added_to_request(self):
+        requested = {}
+
+        class FakeResponse:
+            def raise_for_status(self):
+                pass
+
+            def iter_lines(self):
+                return iter([b'data: {"choices":[{"delta":{"content":"ok"}}]}',
+                             b"data: [DONE]"])
+
+            def close(self):
+                pass
+
+        class FakeSession:
+            def post(self, _url, **kwargs):
+                requested.update(kwargs)
+                return FakeResponse()
+
+        agent = ChatAgent("key", system_prompt="system", thinking="disabled")
+        agent.session = FakeSession()
+        self.assertEqual(agent.ask_stream("question"), "ok")
+        self.assertEqual(requested["json"]["thinking"], {"type": "disabled"})
 
     def test_scheduled_prompt_resets_history_on_next_question(self):
         sent_messages = []
