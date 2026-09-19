@@ -23,12 +23,23 @@ def _after_alt_release(fn, *args):
         pass
 
 def _strip_skeleton_section(text):
-    """vision 答案里的【框架】节（规则4：模型抄录的题目自带框架代码）拆出来。
-    返回 (去掉该节的剩余文本, 框架行列表)；无【框架】节 → (原文本, None)。
-    节边界 = 下一个【…】节头；框架行 = 节内代码块本体（无围栏则整节逐行）"""
+    """拆出 vision 答案的 ``## 框架`` 节，并兼容旧版 ``【框架】`` 标题。"""
     import re as _re
-    heads = [(m.start(), m.end(), m.group(1))
-             for m in _re.finditer(r"【([^】\n]{1,12})】", text)]
+    heads = []
+    offset = 0
+    in_fence = False
+    for line in text.splitlines(keepends=True):
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            in_fence = not in_fence
+        elif not in_fence:
+            legacy = _re.fullmatch(r"【([^】\n]{1,24})】", stripped)
+            markdown = _re.fullmatch(r"#{1,6}\s+(.+?)\s*#*", stripped)
+            match = legacy or markdown
+            if match:
+                name = match.group(1).strip().strip("`*")
+                heads.append((offset, offset + len(line.rstrip("\r\n")), name))
+        offset += len(line)
     idx = next((i for i, h in enumerate(heads) if h[2] == "框架"), None)
     if idx is None:
         return text, None
@@ -152,7 +163,7 @@ def _type_prep(text):
     """打字/粘贴前的答案净化（clippy 用 syntax_tree 解析 markdown 的精简版）：
     带 ``` 代码块 → 只取最后一段代码块本体（笔试目标是代码编辑器，思路文字/围栏
     打进去全是事故）；无代码块（简答/聊天框）→ 去围栏行、剥 ** 与反引号，正文保留。
-    代码块本体再收三道：剥【框架】节（题目自带框架 → 前缀/后缀对齐跳过已有行，
+    代码块本体再收三道：剥 ``## 框架`` / ``【框架】`` 节（题目自带框架 → 前缀/后缀对齐跳过已有行，
     头文件/声明不重复写入）、去公共前缀缩进、行首空格 4:1 换制表符（缩进按一个
     制表符的宽度）"""
     if not text:
@@ -162,7 +173,7 @@ def _type_prep(text):
     text = text.strip()
     if not text:
         return ""
-    text, skeleton = _strip_skeleton_section(text)   # 【框架】节先拆出（无则 None）
+    text, skeleton = _strip_skeleton_section(text)   # 框架节先拆出（无则 None）
     lines = text.splitlines()
     fences = [i for i, ln in enumerate(lines) if ln.lstrip().startswith("```")]
     if len(fences) >= 2:                                # 有围栏：取最后一段代码块内容

@@ -25,6 +25,140 @@ from .winfx import (BG_DARK, WIN_ALPHA, sample_screen_rect, set_acrylic,
 
 GEO_FILE = os.path.join(BASE_DIR, "window-pos.txt")   # 收敛编辑：原 __file__ 相对推导（allow: code 1367）
 
+_MATH_SYMBOLS = {
+    "equiv": "≡", "cdots": "⋯", "ldots": "…", "dots": "…",
+    "times": "×", "cdot": "·", "div": "÷", "pm": "±", "mp": "∓",
+    "le": "≤", "leq": "≤", "ge": "≥", "geq": "≥", "ne": "≠",
+    "neq": "≠", "approx": "≈", "sim": "∼", "propto": "∝",
+    "to": "→", "rightarrow": "→", "leftarrow": "←", "Rightarrow": "⇒",
+    "Leftarrow": "⇐", "leftrightarrow": "↔", "Leftrightarrow": "⇔",
+    "in": "∈", "notin": "∉", "subset": "⊂", "subseteq": "⊆",
+    "supset": "⊃", "supseteq": "⊇", "cup": "∪", "cap": "∩",
+    "land": "∧", "lor": "∨", "neg": "¬", "oplus": "⊕", "otimes": "⊗",
+    "forall": "∀", "exists": "∃", "nexists": "∄", "infty": "∞",
+    "sum": "∑", "prod": "∏", "int": "∫", "partial": "∂", "nabla": "∇",
+    "sqrt": "√", "lfloor": "⌊", "rfloor": "⌋", "lceil": "⌈", "rceil": "⌉",
+    "alpha": "α", "beta": "β", "gamma": "γ", "delta": "δ", "epsilon": "ε",
+    "theta": "θ", "lambda": "λ", "mu": "μ", "pi": "π", "rho": "ρ",
+    "sigma": "σ", "tau": "τ", "phi": "φ", "omega": "ω",
+    "Gamma": "Γ", "Delta": "Δ", "Theta": "Θ", "Lambda": "Λ",
+    "Pi": "Π", "Sigma": "Σ", "Phi": "Φ", "Omega": "Ω",
+    "quad": " ", "qquad": "  ", "left": "", "right": "",
+    "bmod": " mod ", "mod": " mod ", "pmod": " mod ",
+}
+_SUPERSCRIPT = str.maketrans("0123456789+-=()ni", "⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻⁼⁽⁾ⁿⁱ")
+_SUBSCRIPT = str.maketrans(
+    "0123456789+-=()aehijklmnoprstuvx",
+    "₀₁₂₃₄₅₆₇₈₉₊₋₌₍₎ₐₑₕᵢⱼₖₗₘₙₒₚᵣₛₜᵤᵥₓ",
+)
+
+
+def _math_to_unicode(source):
+    """将常见 LaTeX 数学命令转为适合 Tk 文本窗口阅读的 Unicode 表达式。"""
+    import re
+
+    def group(value, start):
+        if start >= len(value) or value[start] != "{":
+            return None, start
+        depth = 0
+        for index in range(start, len(value)):
+            if value[index] == "{":
+                depth += 1
+            elif value[index] == "}":
+                depth -= 1
+                if depth == 0:
+                    return value[start + 1:index], index + 1
+        return None, start
+
+    def replace_one(value, command, render):
+        token = "\\" + command
+        pos = 0
+        while True:
+            index = value.find(token, pos)
+            if index < 0:
+                return value
+            start = index + len(token)
+            while start < len(value) and value[start].isspace():
+                start += 1
+            content, end = group(value, start)
+            if content is None:
+                pos = start
+                continue
+            replacement = render(convert(content))
+            value = value[:index] + replacement + value[end:]
+            pos = index + len(replacement)
+
+    def replace_frac(value):
+        token = "\\frac"
+        pos = 0
+        while True:
+            index = value.find(token, pos)
+            if index < 0:
+                return value
+            start = index + len(token)
+            while start < len(value) and value[start].isspace():
+                start += 1
+            numerator, middle = group(value, start)
+            if numerator is None:
+                pos = start
+                continue
+            while middle < len(value) and value[middle].isspace():
+                middle += 1
+            denominator, end = group(value, middle)
+            if denominator is None:
+                pos = middle
+                continue
+            replacement = f"({convert(numerator)})/({convert(denominator)})"
+            value = value[:index] + replacement + value[end:]
+            pos = index + len(replacement)
+
+    def script(value, marker, table, fallback):
+        def braced(match):
+            content = convert(match.group(1))
+            if all(ord(char) in table for char in content):
+                return content.translate(table)
+            return fallback(content)
+
+        def single(match):
+            content = match.group(1)
+            if ord(content) in table:
+                return content.translate(table)
+            return fallback(content)
+
+        value = re.sub(re.escape(marker) + r"\{([^{}]+)\}", braced, value)
+        return re.sub(re.escape(marker) + r"([A-Za-z0-9])", single, value)
+
+    def convert(value):
+        value = re.sub(r"\\begin\{(?:aligned|align\*?|gathered|cases)\}", "", value)
+        value = re.sub(r"\\end\{(?:aligned|align\*?|gathered|cases)\}", "", value)
+        value = replace_frac(value)
+        for command in ("text", "mathrm", "operatorname", "mathbf", "mathit"):
+            value = replace_one(value, command, lambda content: content)
+        value = replace_one(value, "sqrt", lambda content: f"√({content})")
+        value = replace_one(value, "pmod", lambda content: f"(mod {content})")
+        value = replace_one(value, "hat", lambda content: content + "̂")
+        value = replace_one(value, "bar", lambda content: content + "̄")
+        value = replace_one(value, "overline", lambda content: content + "̄")
+        value = replace_one(value, "vec", lambda content: content + "⃗")
+        value = re.sub(r"\\([{}_%#$&])", r"\1", value)
+        value = re.sub(r"\\[,;:!]", "", value)
+        value = re.sub(r"\\([A-Za-z]+)",
+                       lambda match: _MATH_SYMBOLS.get(match.group(1), match.group(1)),
+                       value)
+        value = value.replace("\\\\", "\n").replace("&", "").replace("~", " ")
+        value = script(value, "^", _SUPERSCRIPT, lambda content: f"^({content})")
+        value = script(value, "_", _SUBSCRIPT, lambda content: f"[{content}]")
+        value = value.replace("*", " × ")
+        for operator in ("≡", "≤", "≥", "≠", "≈", "∼", "∝", "→", "←", "⇒",
+                         "⇐", "↔", "⇔", "∈", "∉", "⊂", "⊆", "⊃", "⊇", "×", "÷"):
+            value = re.sub(rf"\s*{re.escape(operator)}\s*", f" {operator} ", value)
+        value = re.sub(r"\s*=\s*", " = ", value)
+        value = re.sub(r"\s*\+\s*", " + ", value)
+        return "\n".join(re.sub(r"[ \t]+", " ", line).strip()
+                         for line in value.splitlines()).strip()
+
+    return convert(str(source or ""))
+
 
 def _cancel_window_drag(root):
     """结束一次无边框窗口拖动，避免下次点击控件沿用旧起点。"""
@@ -54,10 +188,16 @@ def _move_window_drag(root, event):
     return "break"
 
 
-def show_answer_window(ui_q, prompt_store=None, on_prompt_apply=None):
+def show_answer_window(ui_q, prompt_store=None, on_prompt_apply=None,
+                       hotkey_labels=None):
     import tkinter as tk
+    hotkey_labels = hotkey_labels or {}
+
+    def hotkey(action, fallback):
+        return hotkey_labels.get(action, fallback)
+
     root = tk.Tk()
-    root._user_hidden = False                 # 右上角隐藏按钮与 F4 共用的可见性状态
+    root._user_hidden = False                 # 隐藏按钮与全局显隐快捷键共用状态
     root._settings_open = False
     root._prompt_settings_window = None
     root.overrideredirect(True)                 # 无边框
@@ -272,7 +412,7 @@ def show_answer_window(ui_q, prompt_store=None, on_prompt_apply=None):
         note_list._no_window_drag = True
         notes_text._no_window_drag = True
 
-    # 右上角隐藏按钮：等同 F4，只隐藏窗口而不退出进程；F4 可随时恢复。
+    # 右上角隐藏按钮：只隐藏窗口而不退出进程；全局显隐快捷键可随时恢复。
     hide_btn = tk.Label(root, text="—", bg=BG_DARK, fg=COLORS["muted"],
                         font=(FAM, -13, "bold"), cursor="hand2", padx=5, pady=1)
     hide_btn.place(relx=1.0, x=-10, y=6, anchor="ne")
@@ -284,7 +424,7 @@ def show_answer_window(ui_q, prompt_store=None, on_prompt_apply=None):
         root._user_hidden = True
         root.withdraw()
         log_event({"type": "window_hide", "reason": "hide-btn"})
-        print("窗口已隐藏（按 F4 显示）", flush=True)
+        print(f"窗口已隐藏（按 {hotkey('toggle_window', 'F4')} 显示）", flush=True)
 
     hide_btn.bind("<Button-1>", lambda _e: (on_hide(), "break")[1])
     hide_btn.bind("<Enter>", lambda _e: hide_btn.config(fg=ui_theme["accent"]))
@@ -338,10 +478,31 @@ def show_answer_window(ui_q, prompt_store=None, on_prompt_apply=None):
     a_text.tag_configure("code", font=(CODE_FAM, -14), foreground=COLORS["text"],
                          background=COLORS["code_bg"], lmargin1=12, lmargin2=12,
                          rmargin=12, spacing1=6, spacing2=1, spacing3=6)
+
+    def configure_markdown_tags(tx):
+        tx.tag_configure("md_h1", font=(FAM, -19, "bold"), foreground=COLORS["accent"],
+                         spacing1=10, spacing3=5)
+        tx.tag_configure("md_h2", font=(FAM, -17, "bold"), foreground=COLORS["accent"],
+                         spacing1=9, spacing3=4)
+        tx.tag_configure("md_h3", font=(FAM, -15, "bold"), foreground=COLORS["warm"],
+                         spacing1=7, spacing3=3)
+        tx.tag_configure("md_bold", font=(FAM, -15, "bold"))
+        tx.tag_configure("md_inline", font=(CODE_FAM, -14),
+                         background=COLORS["code_bg"], foreground=COLORS["text"])
+        tx.tag_configure("md_math_inline", font=(CODE_FAM, -14),
+                         foreground=COLORS["warm"])
+        tx.tag_configure("md_math", font=(CODE_FAM, -15), foreground=COLORS["warm"],
+                         background=COLORS["code_bg"], lmargin1=18, lmargin2=18,
+                         rmargin=12, spacing1=7, spacing2=2, spacing3=7)
+        tx.tag_configure("md_quote", foreground=COLORS["muted"],
+                         lmargin1=12, lmargin2=12)
+
+    configure_markdown_tags(a_text)
     if notes_enabled:
         notes_text.tag_configure("code", font=(CODE_FAM, -14), foreground=COLORS["text"],
                                   background=COLORS["code_bg"], lmargin1=12, lmargin2=12,
                                   rmargin=12, spacing1=6, spacing2=1, spacing3=6)
+        configure_markdown_tags(notes_text)
 
     # ---------- 视图跟随策略（流式可读性的关键） ----------
     # follow=True：新内容到达滚到尾部（打字机）；False：用户手动滚上去过 → 锁住他的位置。
@@ -366,26 +527,82 @@ def show_answer_window(ui_q, prompt_store=None, on_prompt_apply=None):
             pass
 
     def insert_md(tx, text):
-        """答案文本插入文字区：把 ```代码围栏``` 渲染成等宽+深底块（见上 code tag），
-        其余原样。此前围栏符原样上屏、代码用非等宽正文显示，缩进对不齐糊成一片。
+        """轻量渲染标题、列表、粗体、行内代码、公式、引用和围栏代码块。
 
         流式未闭合容忍：生成中代码块的闭围栏还没到（只有开围栏）时，旧正则配不上对
         → 围栏行和代码原文裸上屏，等闭围栏到了才"啪"地跳变成块（code 笔试全程可见）。
         现在把「行首开围栏 → 文末」这段直接按代码块渲染并吞掉围栏行：全程无裸露，
         闭围栏到达后走正常配对分支，两条路径渲染结果逐字一致（都 rstrip 掉尾部空行）。"""
         import re as _re
+
+        def insert_inline(value, base_tag=None):
+            pos = 0
+            pattern = _re.compile(
+                r"\*\*([^*\n]+)\*\*|`([^`\n]+)`|\$(?!\$)([^$\n]+)\$")
+            for match in pattern.finditer(value):
+                tags = (base_tag,) if base_tag else ()
+                tx.insert("end", value[pos:match.start()], tags)
+                if match.group(1) is not None:
+                    bold_tags = tuple(t for t in (base_tag, "md_bold") if t)
+                    tx.insert("end", match.group(1), bold_tags)
+                elif match.group(2) is not None:
+                    inline_tags = tuple(t for t in (base_tag, "md_inline") if t)
+                    tx.insert("end", match.group(2), inline_tags)
+                else:
+                    math_tags = tuple(t for t in (base_tag, "md_math_inline") if t)
+                    tx.insert("end", _math_to_unicode(match.group(3)), math_tags)
+                pos = match.end()
+            tags = (base_tag,) if base_tag else ()
+            tx.insert("end", value[pos:], tags)
+
+        def insert_plain_lines(value):
+            for raw in value.splitlines(keepends=True):
+                line = raw.rstrip("\r\n")
+                newline = raw[len(line):]
+                heading = _re.match(r"^\s{0,3}(#{1,6})\s+(.+?)\s*#*\s*$", line)
+                if heading:
+                    level = min(len(heading.group(1)), 3)
+                    insert_inline(heading.group(2), f"md_h{level}")
+                elif _re.match(r"^\s*>\s?", line):
+                    content = _re.sub(r"^\s*>\s?", "", line)
+                    insert_inline(content, "md_quote")
+                elif _re.match(r"^\s*[-+*]\s+", line):
+                    indent = line[:len(line) - len(line.lstrip())]
+                    content = _re.sub(r"^\s*[-+*]\s+", "", line)
+                    tx.insert("end", indent + "• ")
+                    insert_inline(content)
+                elif _re.fullmatch(r"\s*(?:---+|___+|\*\*\*+)\s*", line):
+                    tx.insert("end", "────────────────", "md_quote")
+                else:
+                    insert_inline(line)
+                tx.insert("end", newline)
+
+        def insert_plain(value):
+            pos = 0
+            for match in _re.finditer(r"\$\$(.*?)\$\$", value, _re.S):
+                insert_plain_lines(value[pos:match.start()])
+                tx.insert("end", _math_to_unicode(match.group(1)), "md_math")
+                pos = match.end()
+            rest = value[pos:]
+            open_math = _re.search(r"\$\$(.*)$", rest, _re.S)
+            if open_math:
+                insert_plain_lines(rest[:open_math.start()])
+                tx.insert("end", _math_to_unicode(open_math.group(1)), "md_math")
+            else:
+                insert_plain_lines(rest)
+
         pos = 0
         for m in _re.finditer(r"```[^\n`]*\n(.*?)```", text, _re.S):
-            tx.insert("end", text[pos:m.start()], None)         # 围栏前普通文本
+            insert_plain(text[pos:m.start()])                    # 围栏前 Markdown 正文
             tx.insert("end", m.group(1).rstrip("\n"), "code")   # 块内：吞围栏行，等宽渲染
             pos = m.end()
         rest = text[pos:]
         m_open = _re.search(r"```[^\n`]*\n", rest)              # 未闭合的开围栏行（含换行才算）
         if m_open:
-            tx.insert("end", rest[:m_open.start()], None)
+            insert_plain(rest[:m_open.start()])
             tx.insert("end", rest[m_open.end():].rstrip("\n"), "code")
         else:
-            tx.insert("end", rest, None)
+            insert_plain(rest)
 
     def _style_tabs(bg=None, fg=None, accent=None, muted=None):
         if not notes_enabled:
@@ -484,18 +701,21 @@ def show_answer_window(ui_q, prompt_store=None, on_prompt_apply=None):
         blank = VIEW.get("blank", False)
         st = VIEW["stage"]
         if blank:
-            a_text.insert("end", f"●  新题待命  ·  {profiles.ACTIVE.vision_retry} 截图\n",
+            a_text.insert("end", f"●  新题待命  ·  {hotkey('vision', profiles.ACTIVE.vision_retry)} 截图\n",
                           "st_idle")
         elif st == "rec":
-            a_text.insert("end", "●  录音中  ·  F2 结束\n", "st_rec")
+            a_text.insert("end", f"●  录音中  ·  {hotkey('record_stop', 'F2')} 结束\n",
+                          "st_rec")
         elif st == "transcribing":
             a_text.insert("end", "◌  正在转写\n", "st_work")
         elif st == "answering":
             a_text.insert("end", "◌  正在生成\n", "st_work")
         elif st == "done":
-            a_text.insert("end", "✓  回答完成  ·  F1 录下一题\n", "st_done")
+            a_text.insert("end", f"✓  回答完成  ·  {hotkey('record_start', 'F1')} 录下一题\n",
+                          "st_done")
         else:
-            a_text.insert("end", "●  待命  ·  F1 开始录音\n", "st_idle")
+            a_text.insert("end", f"●  待命  ·  {hotkey('record_start', 'F1')} 开始录音\n",
+                          "st_idle")
         idx = len(hist) - 1 if cur < 0 else cur
         if not blank and 0 <= idx < len(hist):
             item = hist[idx]
@@ -571,7 +791,7 @@ def show_answer_window(ui_q, prompt_store=None, on_prompt_apply=None):
             _sync_follow()  # 滚上去 → 锁定位置（流式不再拽回）；滚回底部 → 恢复跟随
     root.bind_all("<MouseWheel>", on_wheel)
 
-    # ---------- 提词器模式（F8）：贴镜头小窗 + 大字 + 自动滚动 ----------
+    # ---------- 提词器模式：贴镜头小窗 + 大字 + 自动滚动 ----------
     # 摄像头在屏幕上沿中央，答案窗缩成一条贴在正下方 → 读答案时视线偏移 ~3°，
     # 视频里肉眼不可辨（比 AI 眼神矫正更无痕）。F8 切回普通模式。
     tp = {"on": False, "normal_geo": None, "tick": 0}
@@ -588,7 +808,8 @@ def show_answer_window(ui_q, prompt_store=None, on_prompt_apply=None):
             root.geometry(f"{TP_W}x{TP_H}+{(sw - TP_W) // 2}+0")
             a_text.config(font=(FAM, -21))
             a_text.tag_configure("code", font=(CODE_FAM, -19))   # 提词器大字：代码块等宽同步放大
-            status.config(text="提词器模式（贴镜头）· F8 切回")
+            status.config(
+                text=f"提词器模式（贴镜头）· {hotkey('toggle_prompter', 'F8')} 切回")
             if not a_text.get("1.0", "end").strip():   # 无答案才放占位，保留现有文本
                 a_text.insert("1.0", "（答案显示在这里，自动滚动）")
             a_text.see("1.0")
@@ -602,6 +823,8 @@ def show_answer_window(ui_q, prompt_store=None, on_prompt_apply=None):
             a_text.tag_configure("code", font=(CODE_FAM, -14))   # 恢复正常字号：代码块 tag 同步复位
             log_event({"type": "teleprompter", "value": "off"})
             print("📜 提词器模式: 关", flush=True)
+
+    vision_stream = {"index": None}
 
     def poll():
         """主线程消费 UI 事件队列（tkinter 非线程安全，跨线程只能走队列）"""
@@ -643,8 +866,29 @@ def show_answer_window(ui_q, prompt_store=None, on_prompt_apply=None):
                         VIEW["stage"] = "done"
                         A_WATCH["ts"] = 0.0
                     render("tail")
-                elif kind == "vision":          # Alt+P 截图识图：独立一轮
-                    hist.append({"q": "📸 屏幕截图", "a": str(payload)})
+                elif kind == "vision_stream":  # 截图答案流式片段：原位更新同一条历史
+                    idx = vision_stream["index"]
+                    if idx is None or not (0 <= idx < len(hist)):
+                        hist.append({"q": "📸 屏幕截图", "a": ""})
+                        idx = len(hist) - 1
+                        vision_stream["index"] = idx
+                        cur = -1
+                        VIEW["blank"] = False
+                        if notes_enabled:
+                            switch_panel("answer", "top")
+                    hist[idx]["a"] = str(payload)
+                    VIEW["stage"] = "answering"
+                    A_WATCH["ts"] = time.time()
+                    if cur < 0:
+                        render("tail")
+                elif kind == "vision":          # Alt+P 截图识图：最终完整答案
+                    idx = vision_stream["index"]
+                    streamed = idx is not None and 0 <= idx < len(hist)
+                    if streamed:
+                        hist[idx]["a"] = str(payload)
+                    else:
+                        hist.append({"q": "📸 屏幕截图", "a": str(payload)})
+                    vision_stream["index"] = None
                     cur = -1
                     VIEW["blank"] = False
                     VIEW["stage"] = "done"
@@ -652,7 +896,7 @@ def show_answer_window(ui_q, prompt_store=None, on_prompt_apply=None):
                     if notes_enabled:
                         switch_panel("answer", "top")
                     else:
-                        render("top")           # 整段答案一次到位：从【思路】读起
+                        render("tail" if streamed else "top")
                     # 同步推手机（测评场景兜底：窗口藏了/鼠标不出页面也能看答案）
                     if push_on["on"] and str(payload) and not str(payload).startswith("❌"):
                         push_answer("📸 屏幕截图", payload)
@@ -661,7 +905,16 @@ def show_answer_window(ui_q, prompt_store=None, on_prompt_apply=None):
                         TYPING_STATE["text"] = str(payload)
                         TYPING_STATE["pos"] = 0          # 新答案:从 0 开始
                         TYPING_STATE["armed"] = True
+                elif kind == "vision_abort":
+                    idx = vision_stream["index"]
+                    if idx is not None and 0 <= idx < len(hist) and payload:
+                        hist[idx]["a"] += f"\n\n{payload}"
+                    vision_stream["index"] = None
+                    VIEW["stage"] = "idle"
+                    A_WATCH["ts"] = 0.0
+                    render("tail")
                 elif kind == "vision_reset":    # Alt+3 换新题：历史保留，但当前答案区清屏
+                    vision_stream["index"] = None
                     clear_vision_view_state()
                     A_WATCH["ts"] = 0.0
                     my_label.config(text="")

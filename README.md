@@ -14,7 +14,8 @@ https://github.com/any86/Notes/issues/22
 interview-tool/
 ├─ run_quiz.py / run_code.py   # 薄入口：engine.main(profiles.QUIZ/CODE)
 ├─ interview_tool/
-│  ├─ profiles.py              # 双场景差异收容所（提示词/键位/窗口/ESC 策略原文）
+│  ├─ profiles.py              # 双场景差异收容所（提示词/窗口/ESC 策略原文）
+│  ├─ hotkeys.py               # 全局快捷键解析、.env 覆盖与动作分发
 │  ├─ engine.py                # 统一编排主本（由 tools/gen_engine.py 从旧 code 版 main 生成）
 │  ├─ config.py log.py state.py dsp.py audio.py asr.py chat.py
 │  ├─ winfx.py vision.py typing_quiz.py typing_code.py push.py ui.py
@@ -25,7 +26,8 @@ interview-tool/
 └─ tools/                      # parity.py（按符号对比门禁）/ gen_engine.py / gen_profiles.py
 ```
 
-场景差异（提示词/键位/窗口/ESC 退出节奏）一律收容在 `profiles.py` 的 `QUIZ`/`CODE` 两个 Profile，主本零场景判断。包内模块各司一职，多人协作改各自的文件，冲突面小。
+提示词、窗口和 ESC 退出节奏差异收容在 `profiles.py` 的 `QUIZ`/`CODE` 两个 Profile；
+快捷键默认值及 `.env` 覆盖收容在 `hotkeys.py`。包内模块各司一职，多人协作改各自的文件，冲突面小。
 
 ## 文件说明
 
@@ -39,12 +41,13 @@ interview-tool/
 ## 功能链路
 
 - **实时面试**（自动模式，默认开）：双轨录音（回环轨=对方、麦克风轨=自己，外放免耳机）→ 回环 VAD 断句攒问题 → 你开口/停顿自动发送 → 云端转写 → 问答模型按“先概括关键点、再展开说明”作答（优先 DeepSeek，未配置则复用主视觉模型；带历史+简历上下文）→ 屏幕小窗显示；打断自动作废在途答案；全程 WAV + JSONL 落盘复盘。
-- **测评/笔试快答**：截图当前题 → 视觉模型直接出答案 → 答案窗显示 + Telegram 推送（F6）+ 可选自动键入（code 版 Alt+1/Alt+2）。
+- **测评/笔试快答**：截图当前题 → 视觉模型流式生成标准 Markdown 答案 → 答案窗同步渲染标题、列表与代码块 + Telegram 推送（F6）+ 可选自动键入（code 版 Alt+1/Alt+2）。
+- **公式排版**：行内公式使用 `$...$`，关键公式和推导步骤使用独立 `$$...$$` 块；窗口会区分行内公式与公式块，原始 Markdown 保留供复制。
 - **Prompt 场景**：任意时刻只启用一个技术场景（通用 / AI Infra / 前端 / 自定义），语音回答与截图回答同步切换；点击答案窗右上角的场景名称可编辑。
 - **code 笔记专区**：悬浮窗顶部通过「回答 / 笔记」按钮切换；笔记页递归读取 `notes/` 下的 Markdown，只在本地展示，不发送给模型。
 - 防捕获常驻开启：共享屏幕/录屏时答案窗从捕获画面消失，不提供关闭热键。
 
-## 热键速查（以 code 版为例，quiz 版差异见 `profiles.py` 与文件头注释）
+## 热键速查（以下为 code 版默认值，quiz 版默认值见 `hotkeys.py`）
 
 ```
 Alt+P     截屏识图（同题可续截，自动带多轮记忆）
@@ -58,12 +61,36 @@ F9        按住解除门控
 Ctrl+Esc  紧急暂停     ESC×2 或 Ctrl+Q  退出
 ```
 
+### 自定义快捷键
+
+全部键盘操作都可以在 `.env` 中重绑。比如把不合适的 `F4` 显隐窗口改成 `F7`：
+
+```dotenv
+HOTKEY_TOGGLE_WINDOW=F7
+```
+
+支持单键（`F7`）、组合键（`Ctrl+Shift+H`）、多个可选键（`F3|P`）；设为
+`none` 可禁用某项。通用配置同时作用于 quiz/code；加 `QUIZ_` 或 `CODE_` 前缀可只覆盖
+某个入口，场景专用配置优先级更高：
+
+```dotenv
+QUIZ_HOTKEY_VISION=F3|P
+CODE_HOTKEY_VISION=Ctrl+Shift+P
+CODE_HOTKEY_TOGGLE_WINDOW=F7
+```
+
+可配置项完整清单和默认值见 `.env.example`。配置无效时程序会提示并回退默认键位；
+快捷键冲突也会在启动时警告。修改 `.env` 后需要重启程序生效。
+
 ## 配置
 
 复制 `.env.example` 为 `.env` 并填入：
 
 - `ARK_API_KEY` / `ARK_VISION_MODEL` / `VISION_BASE_URL` — 识图视觉模型（OpenAI 兼容）
+- `VISION_THINKING` — 截图模型思考开关，支持 `enabled` / `disabled`；留空使用模型默认值
+- `VISION_TIMEOUT_SECONDS` — 单次截图任务的总等待上限，默认 `120` 秒；长推理可设为 `240`
 - `DEEPSEEK_API_KEY` — 可选；配置后语音问答使用 DeepSeek，留空则复用上述主视觉模型
+- `ANSWER_THINKING` — 问答模型思考开关，支持 `enabled` / `disabled`；留空使用模型默认值
 - `BOT_TOKEN` / `ALLOWED_IDS` / `PROXY` — Telegram 推送
 - `ISI_APPKEY` / `ALIYUN_AK_ID` / `ALIYUN_AK_SECRET` / `DASHSCOPE_API_KEY` — 转写/备用 ASR（可选）
 
@@ -74,7 +101,7 @@ Ctrl+Esc  紧急暂停     ESC×2 或 Ctrl+Q  退出
 答案窗右上角显示当前场景，点击场景名称或齿轮打开设置窗口。场景是单选的：保存
 `AI Infra` 后，语音和截图都会使用 Infra Prompt；再保存`前端`后，Infra 场景立即失效。
 
-- 内置 `通用 / AI Infra / 前端`，均可修改并恢复默认。
+- 内置 `通用 / AI Infra / 前端`，均可修改并恢复默认；首次启动默认使用领域中立的`通用`场景。
 - 可以把当前内容另存为自定义场景，自定义场景可删除。
 - 每个场景分别保存语音 Prompt、截图 Prompt 和默认编程语言。
 - 修改只影响下一次请求；正在生成的回答不会被中断。
@@ -111,11 +138,11 @@ python run_code.py --manual
 
 手动模式操作流程：
 
-1. 按 `F1` 开始录音。
-2. 等面试官说完问题后按 `F2`。
+1. 按 `F1`（默认，可通过 `.env` 修改）开始录音。
+2. 等面试官说完问题后按 `F2`（默认，可通过 `.env` 修改）。
 3. 程序停止本轮录音，将音频提交云端转写；转写文本上屏后，自动调用问答模型生成答案。
 
-手动模式默认同时启动电脑回环和麦克风，因此既能收电脑播放的面试官声音，也能直接用麦克风讲话测试；按 `F10` 可在“全听”和“只听电脑输出”之间切换。
+手动模式默认同时启动电脑回环和麦克风，因此既能收电脑播放的面试官声音，也能直接用麦克风讲话测试；默认按 `F10` 可在“全听”和“只听电脑输出”之间切换。
 
 手动模式也可以和其他启动参数组合，例如：
 

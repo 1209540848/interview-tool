@@ -9,7 +9,6 @@
 interview_tool 内各模块。属主规则（R1/R2）与差异收容表见 profiles.py docstring。
 """
 import argparse
-import ctypes
 import os
 import queue
 import sys
@@ -32,12 +31,13 @@ from .config import (AUTO_ATTACH_ON, B_TRIGGER_SEC, BLOCK,
                      MY_ANSWER_MAX_CHARS, MY_ANSWER_TEXT_MAX, MY_BATCH_SEC,
                      SAMPLE_RATE, _env_get)
 from .dsp import GateState, SpeechDetector
+from .hotkeys import HotkeyBindings, HotkeyRuntime
 from .log import log_event
 from .prompt_store import PromptStore
 from .push import push_answer
 from .state import (ACRYLIC, CHAMELEON, TYPING_STATE, VISION_STATE, push_on,
                     stealth)
-from .typing_code import _after_alt_release, paste_answer_into_foreground
+from .typing_code import paste_answer_into_foreground
 from .ui import hist, load_history_from_logs, save_window_geometry, \
     show_answer_window
 from .vision import _vis_mem_reset, _vision_providers, do_vision
@@ -47,7 +47,7 @@ from .winfx import set_capture_excluded
 def main(profile):
     profiles.ACTIVE = profile        # flavor 激活：分叉段与 ACTIVE.* 字段取用（run_quiz/run_code 传入）
     prompt_store = PromptStore()     # 技术场景独立于 quiz/code；任意时刻只激活一个
-    # 打字实现注入：quiz 裸 1 走简化打字（原文语义）；code Alt+1 走 _after_alt_release 包 code 版
+    # 打字实现注入：quiz/code 保留各自的前台输入策略，按键与松键等待由 hotkeys 统一处理。
     type_answer_into_foreground = (typing_quiz.type_answer_into_foreground
                                    if profile.key == "quiz"
                                    else typing_code.type_answer_into_foreground)
@@ -72,6 +72,10 @@ def main(profile):
     args = ap.parse_args()
     ACRYLIC["on"] = args.acrylic   # 模块级标志：答案窗按此决定磨砂玻璃 / 灰色实底
     CHAMELEON["on"] = args.chameleon
+    hotkeys = HotkeyBindings(profile.key)
+    profiles.ACTIVE.vision_retry = hotkeys.label("vision")
+    for warning in hotkeys.warnings:
+        print(f"⚠️ 快捷键配置: {warning}", flush=True)
 
     # 问答后端优先级：显式 --api-key / DEEPSEEK_API_KEY → DeepSeek；否则复用
     # 主识图链路的 key、模型和 URL。视觉模型是多模态模型，也可接收纯文本问题。
@@ -99,6 +103,8 @@ def main(profile):
     log.start_session(answer_model, args.no_inject)   # R3 注入：原 4 行块（global 声明+建目录+命名+session_start）封装
     log_event({"type": "prompt_scene", "scene_id": active_scene["id"],
                "scene_name": active_scene["name"], "reason": "session_start"})
+    log_event({"type": "hotkeys", "profile": profile.key,
+               "bindings": hotkeys.labels(), "warnings": hotkeys.warnings})
 
     # 崩溃兜底：hidden-start 启动无控制台，任何线程异常都落到 logs/interview-crash.log
     def _crash_hook(etype, val, tb):
@@ -153,7 +159,8 @@ def main(profile):
     root = None
     if not args.no_window:
         root = show_answer_window(ui_q, prompt_store=prompt_store,
-                                  on_prompt_apply=on_prompt_apply)
+                                  on_prompt_apply=on_prompt_apply,
+                                  hotkey_labels=hotkeys.labels())
         set_capture_excluded(root, stealth["on"])   # 防捕获常驻开启
 
     if not args.no_inject:
@@ -384,7 +391,8 @@ def main(profile):
                         ui_pending()
                     elif kind == "f9_on":
                         f9_override["on"] = True
-                        print("🎤 F9 按住：强制收录你的声音", flush=True)
+                        print(f"🎤 {hotkeys.label('force_mic')} 按住：强制收录你的声音",
+                              flush=True)
                     elif kind == "f9_off":
                         f9_override["on"] = False
                         print("🎤 强制收录结束", flush=True)
@@ -502,292 +510,31 @@ def main(profile):
         threading.Thread(target=wav_writer.run, daemon=True).start()
         print(f"🎙 全程录音落盘: {wav_dir}", flush=True)
 
-    # 热键轮询（GetAsyncKeyState：F10 切模式 / F9 临时麦克风 /
-    # F4 隐藏窗口 / F8 提词器模式 / F6 手机推送 / Ctrl+Esc 暂停 /
-    # Alt+P 识图 / Alt+1 打字 / Alt+2 粘贴 / Alt+3 清识图记忆——笔试写码安全的组合键）
-    VK_F1, VK_F2 = 0x70, 0x71
-    VK_F4 = 0x73    # VK_F3 已废弃：识图收敛到 Alt+P，裸 F3 在浏览器/IDE 有默认行为不再占用
-    VK_F3 = 0x72    # quiz 测评版主键：F3/P 裸键识图（code 场景废弃——f3/p 槽无人读写）
-    VK_F6, VK_F8, VK_F9, VK_F10 = 0x75, 0x77, 0x78, 0x79
-    VK_ESC, VK_CTRL, VK_Q = 0x1B, 0x11, 0x51
-    VK_ALT = 0x12
-    VK_UP, VK_DOWN = 0x26, 0x28
-    hk = {"f10": False, "esc": False, "f4": False, "f8": False,
-          "f6": False, "f1": False, "f2": False,
-          "f9": False, "up": False, "down": False, "esc_alone": False,
-          "altp": False, "alt1": False, "alt2": False, "alt3": False,
-          "f3": False, "p": False, "d1": False}   # quiz 测评版槽位（code 场景无人读写）
-    hidden_state = {"v": False}      # F4 窗口隐藏状态
-    esc_exit_prev = 0.0              # ESC 双按退出计时（写码时 IDE 单按 ESC 极常见，见下）
-    f8_last = 0.0                    # F8 防抖：连按/键盘重复不把提词器状态抖乱
-
-    def key_down(vk):
-        try:
-            return bool(ctypes.windll.user32.GetAsyncKeyState(vk) & 0x8000)
-        except Exception:
-            return False
-
-    def set_mode(m):
-        with st_lock:
-            state["mode"] = m
-        log_event({"type": "mode", "value": m})
-        print(f"🔀 模式: {'只听（只转写面试官）' if m == 'listen' else '全听（你的话也注入）'}", flush=True)
-        set_status("只听模式 · F10切换" if m == "listen" else "全听模式 · F10切换")
-
-    def hotkey_loop():
-        nonlocal esc_exit_prev, f8_last   # 双按/F8 防抖计时在 main 作用域，赋值需声明
-        while True:
-            time.sleep(0.08)
-            f10 = key_down(VK_F10)
-            if f10 and not hk["f10"]:
-                if args.manual:
-                    with st_lock:
-                        m = state["mode"]
-                    set_mode("full" if m == "listen" else "listen")
-                    if recorder_mic:
-                        recorder_mic.start() if m == "listen" else recorder_mic.stop()
-                else:
-                    # 自动模式：F10 = 你的回答是否附注给模型（默认开）
-                    attach_on["on"] = not attach_on["on"]
-                    print(f"🔗 附注你的回答: {'开' if attach_on['on'] else '关'}", flush=True)
-                    set_status(("🔗 附注开" if attach_on["on"] else "🔗 附注关") + " · F10切换")
-            hk["f10"] = f10
-            esc = key_down(VK_ESC)
-            if esc and not hk["esc"] and key_down(VK_CTRL):
-                with st_lock:
-                    state["paused"] = not state["paused"]
-                    paused = state["paused"]
-                if paused:
-                    recorder_loop.stop()
-                    if recorder_mic:
-                        recorder_mic.stop()
-                    if not args.manual:
-                        event_q.put(("reset", None))   # 暂停也清状态（防 B 触发陈年 pending）
-                    print("⏸️ 已暂停（录音+生成全停）", flush=True)
-                    set_status("⏸️ 已暂停 · Ctrl+Esc恢复")
-                else:
-                    recorder_loop.start()
-                    with st_lock:
-                        mic_should_run = not args.manual or state["mode"] == "full"
-                    if recorder_mic and mic_should_run:
-                        recorder_mic.start()
-                    if not args.manual:
-                        event_q.put(("reset", None))   # 清 pending/detector/门控（防陈年触发）
-                    print("▶️ 已恢复", flush=True)
-                    set_status("只听模式 · F10切换" if state["mode"] == "listen"
-                               else "全听模式 · F10切换")
-            hk["esc"] = esc
-            # ESC 单独按：退出进程。quiz 版：单按即退（下方第一支，原文整段）；⚠️ code 笔试版：
-            # 写码时 IDE/编辑器单按 ESC 极常见（关补全、取消弹窗）——单按退出是事故
-            # （2026-09-06 实测被连杀两次），需 0.8s 内连按两次才退（第二支原文）。
-            # Ctrl+Esc 仍是暂停（上面分支），Ctrl+Q 仍一键退
-            esc_alone = esc and not key_down(VK_CTRL)
-            if esc_alone and not hk["esc_alone"]:
-                if profile.key == "quiz":   # quiz 版：ESC 单按即退（原文整段）
-                    log_event({"type": "session_end", "reason": "ESC"})
-                    if root is not None:
-                        save_window_geometry(root.geometry())      # 记住位置，下次回到这
-                    print("👋 ESC 退出", flush=True)
-                    os._exit(0)
-                if time.time() - esc_exit_prev < 0.8:
-                    log_event({"type": "session_end", "reason": "ESC双按"})
-                    if root is not None:
-                        save_window_geometry(root.geometry())      # 记住位置，下次回到这
-                    print("👋 ESC 双按退出", flush=True)
-                    os._exit(0)
-                esc_exit_prev = time.time()     # 第一下：只记时刻，0.8s 内再按才退
-            hk["esc_alone"] = esc_alone
-            # F1 开始录音（手动定界：录多久自己定，杜绝 VAD 误判半截问题）
-            f1 = key_down(VK_F1)
-            if f1 and not hk["f1"]:
-                with st_lock:
-                    epoch["n"] += 1          # 新一轮：在途旧答案作废
-                # 手动录音两轨都攒（不区分 listen/full）：面试官问题 + 你的话都能录
-                if recorder_loop:
-                    recorder_loop.start_rec()
-                if recorder_mic:
-                    recorder_mic.start_rec()
-                ui("rec_on")
-                print("🎙️ 开始录音（F2 结束）", flush=True)
-            hk["f1"] = f1
-            # F2 结束录音：攒的音频 → 转写 → 提问上屏 → 生成回答
-            f2 = key_down(VK_F2)
-            if f2 and not hk["f2"]:
-                bufs = []
-                if recorder_loop:
-                    bufs += recorder_loop.stop_rec()
-                if recorder_mic:
-                    bufs += recorder_mic.stop_rec()
-                if not bufs:
-                    ui("rec_off")
-                    ui("status", "没录到内容（先按 F1 开始录音）")
-                    ui("idle")
-                    print("⚠️ F2 无录音内容", flush=True)
-                else:
-                    ui("rec_off")            # 转写中标志
-                    threading.Thread(target=_manual_go, args=(bufs,), daemon=True).start()
-            hk["f2"] = f2
-            if profile.key == "quiz":
-                # ---- quiz 测评版原文：F3/P 裸键识图 + 裸 1 自动打字 ----
-                # F3 / P 截屏识图（面试官共享屏幕/测评题目截图，按一下直接出答案）
-                # P 是测评场景主键：F 键在浏览器有默认行为（F3=查找栏）且部分测评页
-                # 拦截 F 键；P 是普通字母键，答题不聚焦输入框时页面收不到任何副作用
-                f3 = key_down(VK_F3)
-                pkey = key_down(0x50)                       # VK_P
-                if not VISION_STATE["busy"] and ((f3 and not hk["f3"]) or (pkey and not hk["p"])):
-                    VISION_STATE["busy"] = True
-                    set_status("📝 测评识图中…")
-                    threading.Thread(target=do_vision, args=(ui, prompt_store), daemon=True).start()
-                hk["f3"] = f3
-                hk["p"] = pkey
-                # 数字 1：把最新识图答案模拟真人打字打进当前焦点输入框（再按 1 = 停止）。
-                # 只在有答案待打时监听——平时 1 键不劫持，答题框里正常输 1
-                k1 = key_down(0x31)                     # VK_1
-                if k1 and not hk["d1"]:
-                    if TYPING_STATE["busy"]:
-                        TYPING_STATE["stop"] = True     # 正在打：再按 1 = 停止（已打不撤销）
-                    elif TYPING_STATE["armed"] and TYPING_STATE["text"]:
-                        TYPING_STATE["armed"] = False
-                        print("⌨️ 自动输入开始…（点好答题框光标后按 1；再按 1 停止）", flush=True)
-                        threading.Thread(target=type_answer_into_foreground,
-                                         args=(TYPING_STATE["text"],), daemon=True).start()
-                hk["d1"] = k1
-            else:
-                # ---- code 笔试版原文：Alt+P/Alt+1/Alt+2/Alt+3（裸键全释放防误触发）----
-                # ---- 识图/注入组合键全部收敛成 Alt+（2026-09-06 改）：裸键全释放 ----
-                # 旧版裸 P 截屏、armed 时裸 1/裸 2 注入：正常敲代码时 P/数字键太常见，
-                # 误触发会突然截图/突然打字/突然整段粘贴——笔试写码场景不可接受。
-                # Alt+P 识图 / Alt+1 打字 / Alt+2 粘贴 / Alt+3 清记忆：正常打字永不误发。
-                # 判定用「同时按下」：Alt 按住期间目标键按下即触发（Alt 松开后动作才执行）。
-                pkey = key_down(0x50)                       # VK_P
-                k1 = key_down(0x31)                         # VK_1
-                k2 = key_down(0x32)                         # VK_2
-                alt = key_down(VK_ALT)
-                altp = alt and pkey
-                if altp and not hk["altp"]:
-                    if VISION_STATE["busy"]:
-                        # 上一张还在识别中：连按 Alt+P 曾静默吞掉（无日志无提示，像「识图失败」）
-                        log_event({"type": "altp_ignored", "why": "vision_busy"})
-                        set_status("⏳ 上一张还在识别中，稍候…")
-                    else:
-                        VISION_STATE["busy"] = True
-                        set_status("💻 笔试识图中…（同题续截自动带上下文）")
-                        threading.Thread(target=do_vision, args=(ui, prompt_store), daemon=True).start()
-                hk["altp"] = altp
-                # Alt+1：把最新识图答案模拟真人打字打进当前焦点输入框（再按 Alt+1 = 停止）。
-                # 只在有答案待打时生效——平时 1 键不劫持，答题框里正常输 1
-                alt1 = alt and k1
-                if alt1 and not hk["alt1"]:
-                    log_event({"type": "alt1_press", "armed": TYPING_STATE["armed"],
-                               "busy": TYPING_STATE["busy"],
-                               "text_len": len(TYPING_STATE["text"] or "")})
-                    if TYPING_STATE["busy"]:
-                        if time.time() - TYPING_STATE["start_ts"] > 1.0:
-                            TYPING_STATE["stop"] = True  # 正在打：隔 1 秒以上再按才停（1 秒内防连按误停）
-                        else:
-                            log_event({"type": "alt1_ignored",
-                                       "why": "typing刚启动1秒内，忽略第二次按"})
-                    elif TYPING_STATE["armed"] and TYPING_STATE["text"]:
-                        TYPING_STATE["armed"] = False
-                        print("⌨️ 自动输入开始…（松开 Alt 后自动打；框架已有行自动跳过，光标放函数体内；再按 Alt+1 停止）", flush=True)
-                        threading.Thread(target=_after_alt_release,
-                                         args=(type_answer_into_foreground,
-                                               TYPING_STATE["text"]), daemon=True).start()
-                hk["alt1"] = alt1
-                # Alt+2：剪贴板粘贴整段答案（clippy 同款 paste 兜底通道）。
-                # 打字链路在编辑器里吞字符/不出字时，Ctrl+V 对浏览器零抵抗力，一键换路
-                alt2 = alt and k2
-                if alt2 and not hk["alt2"]:
-                    log_event({"type": "alt2_press", "armed": TYPING_STATE["armed"],
-                               "busy": TYPING_STATE["busy"],
-                               "text_len": len(TYPING_STATE["text"] or "")})
-                    if TYPING_STATE["busy"]:
-                        log_event({"type": "alt2_ignored", "why": "busy"})
-                    elif TYPING_STATE["armed"] and TYPING_STATE["text"]:
-                        TYPING_STATE["armed"] = False
-                        print("📋 粘贴模式…（松开 Alt 后整段粘贴到焦点框）", flush=True)
-                        threading.Thread(target=_after_alt_release,
-                                         args=(paste_answer_into_foreground,),
-                                         daemon=True).start()
-                hk["alt2"] = alt2
-                # Alt+3：清空识图多轮记忆（换新题/切题目场景时按，防旧截图旧解答污染新题）
-                alt3 = alt and key_down(0x33)               # VK_3
-                if alt3 and not hk["alt3"]:
-                    dropped = _vis_mem_reset("Alt+3 手动清空")
-                    ui("vision_reset")               # 清掉当前显示/旧答案待输入态，历史仍可回看
-                    if dropped:
-                        print("🧹 识图多轮记忆已清空（截图+旧解答全丢）", flush=True)
-                        ui("status", "🧹 识图记忆已清空（Alt+3）")
-                    else:
-                        ui("status", "🧹 本就无识图记忆")
-                hk["alt3"] = alt3
-            # F4 隐藏/显示窗口（面试官靠近/共享屏幕时一键藏）
-            f4 = key_down(VK_F4)
-            if f4 and not hk["f4"] and root is not None:
-                hidden_state["v"] = not bool(
-                    getattr(root, "_user_hidden", hidden_state["v"]))
-                root._user_hidden = hidden_state["v"]
-                if hidden_state["v"]:
-                    root.withdraw()
-                    print("🙈 窗口已隐藏（再按 F4 显示）", flush=True)
-                else:
-                    root.deiconify()
-                    print("👁️ 窗口已显示", flush=True)
-            hk["f4"] = f4
-            # ↑/↓ 当前页导航：回答页翻历史，笔记页切上一篇/下一篇。
-            up = key_down(VK_UP)
-            if up and not hk["up"]:
-                ui("nav", -1)
-            hk["up"] = up
-            down = key_down(VK_DOWN)
-            if down and not hk["down"]:
-                ui("nav", 1)
-            hk["down"] = down
-            # F8 提词器模式开关（贴镜头小窗+大字滚动；切回普通窗）
-            f8 = key_down(VK_F8)
-            if hk["f8"] and not f8:
-                now = time.time()
-                if now - f8_last > 0.6:
-                    f8_last = now
-                    ui("tp_toggle")
-            hk["f8"] = f8
-            # F9 按住：自动模式强制解除门控（面试官说话期间你补充/纠正，麦克风全收）
-            f9 = key_down(VK_F9)
-            if f9 and not hk["f9"] and not args.manual:
-                with st_lock:
-                    paused = state["paused"]
-                if not paused:
-                    event_q.put(("f9_on", None))
-            elif not f9 and hk["f9"] and not args.manual:
-                event_q.put(("f9_off", None))
-            hk["f9"] = f9
-            # F6 手机推送开关（兜底渠道，启动常驻开）
-            f6 = key_down(VK_F6)
-            if f6 and not hk["f6"]:
-                push_on["on"] = not push_on["on"]
-                print(f"📱 手机推送: {'开' if push_on['on'] else '关'}", flush=True)
-                set_status(("📱 推送开" if push_on["on"] else "推送关") + " · F6切换")
-            hk["f6"] = f6
-            # Ctrl+Q 一键退出（进程+窗口一起没）
-            if key_down(VK_CTRL) and key_down(VK_Q):
-                log_event({"type": "session_end", "reason": "Ctrl+Q"})
-                if root is not None:
-                    save_window_geometry(root.geometry())      # 记住位置，下次回到这
-                print("👋 Ctrl+Q 退出", flush=True)
-                os._exit(0)
-
-    threading.Thread(target=hotkey_loop, daemon=True).start()
+    # 所有快捷键统一从 .env 解析；默认值保持旧行为。
+    hotkey_runtime = HotkeyRuntime(
+        bindings=hotkeys, profile_key=profile.key, manual=args.manual,
+        root=root, ui=ui, set_status=set_status, state=state,
+        state_lock=st_lock, epoch=epoch, recorder_loop=recorder_loop,
+        recorder_mic=recorder_mic,
+        event_q=event_q if not args.manual else None,
+        attach_on=attach_on if not args.manual else None,
+        prompt_store=prompt_store, type_answer=type_answer_into_foreground,
+        paste_answer=paste_answer_into_foreground, do_vision=do_vision,
+        reset_vision=_vis_mem_reset, save_geometry=save_window_geometry,
+        manual_handler=_manual_go,
+    )
+    threading.Thread(target=hotkey_runtime.run, daemon=True).start()
 
     # 启动：录音流常开（F1/F2 控制攒与不攒）；防捕获与手机推送常驻开
     recorder_loop.start()
     if recorder_mic:
         recorder_mic.start()   # 自动模式常开；手动模式默认全听，F1/F2 同时收两轨
+    print(hotkeys.banner(args.manual), flush=True)
     if not args.manual:
-        print(profiles.ACTIVE.banner_auto, flush=True)   # 就绪横幅原文在 profiles（两版差异收容）
         set_status("🕶️ 防捕获开 · 📱 推送开 · 自动模式")
     else:
-        print(profiles.ACTIVE.banner_manual, flush=True)   # 就绪横幅原文在 profiles（两版差异收容）
-        set_status("🕶️ 防捕获开 · 📱 推送开 · 手动全听模式 · F10切换")
+        set_status("🕶️ 防捕获开 · 📱 推送开 · 手动全听模式 · "
+                   f"{hotkeys.label('toggle_mode')}切换")
     print("=" * 50, flush=True)
 
     if root is not None:

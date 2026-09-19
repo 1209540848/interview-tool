@@ -7,6 +7,8 @@
 不同 → 已收进 profiles.py 的 Profile 字段（vision_prompt/vision_max_tokens/vision_retry）；
 技术方向由 engine 注入的 PromptStore 在每次截图时追加，和运行模式保持解耦。
 do_vision 统一主本（code 版；quiz 问图段更简，同构差异收敛到 profiles）。"""
+import time
+
 from .config import _env_get
 from .log import log_event
 from .state import VIS_MEM, VIS_MEM_LOCK, VISION_STATE
@@ -23,8 +25,28 @@ from . import profiles          # quiz/code 问图协议取 ACTIVE；技术场�
 VISION_MODEL = "doubao-1.5-vision-lite-250315"     # 默认火山豆包轻量视觉（便宜快）
 VISION_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3/chat/completions"
 VISION_FALLBACK_URL = "https://ark.cn-beijing.volces.com/api/v3/responses"
+DEFAULT_VISION_TIMEOUT_SECONDS = 120.0
 # VISION_PROMPT / VISION_MAX_TOKENS / 答崩提示按键名已收敛 → profiles.ACTIVE.vision_*
 # （两版文本不同，删 const 防双抄漂移；code 文本现值见 profiles.CODE.vision_prompt）
+
+
+def _vision_timeout_seconds():
+    """读取单次截图任务的总等待上限；非法值回退旧默认 120 秒。"""
+    raw = _env_get("VISION_TIMEOUT_SECONDS")
+    if not raw:
+        return DEFAULT_VISION_TIMEOUT_SECONDS
+    try:
+        seconds = float(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_VISION_TIMEOUT_SECONDS
+    return seconds if 1.0 <= seconds <= 3600.0 else DEFAULT_VISION_TIMEOUT_SECONDS
+
+
+def _request_timeout(deadline, requests):
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise requests.exceptions.ReadTimeout("识图总等待时间已达到上限")
+    return min(15.0, remaining), remaining
 
 
 def _vis_mem_note(img_pil, ans, expected_generation=None):
@@ -127,6 +149,80 @@ def _vision_parse(j):
         except Exception:
             return None
 
+
+def _vision_thinking():
+    """返回统一的视觉思考开关；空值表示沿用模型默认行为。"""
+    value = _env_get("VISION_THINKING").strip().lower()
+    if value not in ("", "enabled", "disabled"):
+        print("⚠️ VISION_THINKING 仅支持 enabled/disabled，已忽略当前值",
+              flush=True)
+        return ""
+    return value
+
+
+def _stream_content_text(content):
+    """兼容厂商把流式 content 表示成字符串或内容块列表。"""
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    texts = []
+    for item in content:
+        if not isinstance(item, dict):
+            continue
+        text = item.get("text")
+        if isinstance(text, str):
+            texts.append(text)
+    return "".join(texts)
+
+
+def _vision_stream_delta(event):
+    """从 Chat/Responses SSE 事件提取最终答案增量，主动跳过 reasoning。"""
+    try:
+        choices = event.get("choices") or []
+        if choices:
+            delta = choices[0].get("delta") or {}
+            return _stream_content_text(delta.get("content"))
+    except (AttributeError, IndexError, TypeError):
+        pass
+    event_type = event.get("type", "") if isinstance(event, dict) else ""
+    if event_type in ("response.output_text.delta", "response.content_text.delta"):
+        delta = event.get("delta", "")
+        return delta if isinstance(delta, str) else ""
+    return ""
+
+
+def _read_vision_stream(response, deadline, on_chunk=None):
+    """读取 SSE 并返回完整答案；on_chunk 接收不断增长的最终答案文本。"""
+    import json
+    import requests
+    parts = []
+    final_text = ""
+    for raw in response.iter_lines(chunk_size=32):
+        if time.monotonic() >= deadline:
+            raise requests.exceptions.ReadTimeout("识图总等待时间已达到上限")
+        line = (raw.decode("utf-8", "ignore")
+                if isinstance(raw, bytes) else str(raw)).strip()
+        if not line.startswith("data:"):
+            continue
+        data = line[5:].strip()
+        if not data or data == "[DONE]":
+            continue
+        try:
+            event = json.loads(data)
+        except (TypeError, ValueError):
+            continue
+        delta = _vision_stream_delta(event)
+        if delta:
+            parts.append(delta)
+            if on_chunk is not None:
+                on_chunk("".join(parts))
+            continue
+        parsed = _vision_parse(event)
+        if parsed:
+            final_text = parsed
+    return "".join(parts).strip() or final_text.strip() or None
+
 def _crop_center_zoom(img, fx=1.8):
     """裁屏幕中央 60% 宽 × 75% 高（题目主体一般在中间偏上）再放大 fx 倍——
     小图形/小数字整图里看不清，裁出来放大后模型才认得（穷替版 VisualCoT）"""
@@ -137,7 +233,8 @@ def _crop_center_zoom(img, fx=1.8):
     crop = img.crop((x0, y0, x0 + cw, y0 + ch))
     return crop.resize((max(1, int(cw * fx)), max(1, int(ch * fx))), resample=Image.LANCZOS)
 
-def _ask_vision_multi(key, model, url, parts, prompt, max_tokens):
+def _ask_vision_multi(key, model, url, parts, prompt, max_tokens, deadline=None,
+                      on_chunk=None):
     """多图识图核心（2026-09-06 多轮记忆的基础，单请求多图已实测支持）：
     parts 每项是 PIL.Image 或 {"b64": 已编码字符串}，按旧→新排列，最后一张最新；
     一次性全喂——同题续截（拼图/报错）模型自己对照，省一次往返。
@@ -157,36 +254,59 @@ def _ask_vision_multi(key, model, url, parts, prompt, max_tokens):
     imgs = [{"type": "image_url",
              "image_url": {"url": f"data:image/jpeg;base64,{b}"}} for b in b64s]
     body = {"model": model, "messages": [{"role": "user",
-            "content": imgs + [{"type": "text", "text": prompt}]}], "max_tokens": max_tokens}
-    # 超时 (15, 120)：多轮记忆大请求 + 新模型首 token 慢，60s 单值实测被
-    # HTTPConnectionPool 超时打爆（2026-09-12 用户高频复现）——对齐 chat.py 写法
-    r = requests.post(url, headers=hdr, json=body, timeout=(15, 120))
+            "content": imgs + [{"type": "text", "text": prompt}]}],
+            "max_tokens": max_tokens, "stream": True}
+    thinking = _vision_thinking()
+    if thinking:
+        body["thinking"] = {"type": thinking}
+    if deadline is None:
+        deadline = time.monotonic() + _vision_timeout_seconds()
+    # 所有整图/放大/备用尝试共享同一个 deadline，避免一次截图因重试拖成上限的数倍。
+    r = requests.post(url, headers=hdr, json=body,
+                      timeout=_request_timeout(deadline, requests), stream=True)
     if r.status_code == 200:
-        return _vision_parse(r.json()), 200
+        try:
+            return _read_vision_stream(r, deadline, on_chunk), 200
+        finally:
+            r.close()
     if r.status_code in (400, 404):                 # chat 格式/模型入口被拒 → 回退 responses 格式
+        r.close()
         body2 = {"model": model, "input": [{"role": "user", "content":
             [{"type": "input_image",
               "image_url": f"data:image/jpeg;base64,{b}"} for b in b64s] +
-            [{"type": "input_text", "text": prompt}]}]}
-        r2 = requests.post(VISION_FALLBACK_URL, headers=hdr, json=body2, timeout=(15, 120))
+            [{"type": "input_text", "text": prompt}]}], "stream": True}
+        if thinking:
+            body2["thinking"] = {"type": thinking}
+        r2 = requests.post(VISION_FALLBACK_URL, headers=hdr, json=body2,
+                           timeout=_request_timeout(deadline, requests), stream=True)
         if r2.status_code == 200:
-            return _vision_parse(r2.json()), 200
+            try:
+                return _read_vision_stream(r2, deadline, on_chunk), 200
+            finally:
+                r2.close()
+        r2.close()
         return None, r2.status_code
+    r.close()
     return None, r.status_code
 
 def _ask_vision_once(key, model, url, img, prompt, max_tokens):
     """单张 PIL 图入口（保留旧签名兼容）→ 走多图核心"""
     return _ask_vision_multi(key, model, url, [img], prompt, max_tokens)
 
-def _ask_vision_retry(key, model, url, parts, prompt, max_tokens):
-    """识图带一次自动重试：HTTPConnectionPool 超时（大图+多轮记忆请求重、模型端
-    慢/不稳）是「识图异常」最常见根因，重试一次多半能成；重试仍超时再抛给上层"""
+def _ask_vision_retry(key, model, url, parts, prompt, max_tokens, deadline=None,
+                      on_chunk=None):
+    """连接瞬断时在总预算内重试一次；读取超时不重启同一个长推理请求。"""
     import requests
+    if deadline is None:
+        deadline = time.monotonic() + _vision_timeout_seconds()
     for attempt in (1, 2):
         try:
-            return _ask_vision_multi(key, model, url, parts, prompt, max_tokens)
+            return _ask_vision_multi(key, model, url, parts, prompt, max_tokens,
+                                     deadline=deadline, on_chunk=on_chunk)
+        except requests.exceptions.ReadTimeout:
+            raise
         except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
-            if attempt == 2:
+            if attempt == 2 or time.monotonic() >= deadline:
                 raise
             log_event({"type": "vision_retry", "why": type(e).__name__,
                        "err": str(e)[:120]})
@@ -223,6 +343,8 @@ def do_vision(ui, prompt_store=None):
         from PIL import Image, ImageGrab
         import time as _time
         t0 = _time.time()
+        timeout_seconds = _vision_timeout_seconds()
+        deadline = _time.monotonic() + timeout_seconds
         ui("ov_ctl", "hide")                        # 置顶窗先离场：它会被截进图，模型看见「Alt+P截」等字样拒答
         try:
             _time.sleep(0.35)                       # 等 Tk 主线程 withdraw + 合成一帧
@@ -246,13 +368,32 @@ def do_vision(ui, prompt_store=None):
         else:
             prompt = profiles.ACTIVE.vision_prompt
         prompt += mem_suffix
+        stream_state = {"last_emit": 0.0}
+
+        def emit_stream(text, prefix=""):
+            """节流 UI 更新，并拒绝 Alt+3/场景切换后的旧流式片段。"""
+            now = _time.monotonic()
+            if now - stream_state["last_emit"] < 0.05:
+                return
+            with VIS_MEM_LOCK:
+                memory_current = VIS_MEM["generation"] == mem_generation
+                scene_current = (prompt_store is None
+                                 or prompt_store.revision == scene_revision)
+                if memory_current and scene_current:
+                    ui("vision_stream", prefix + text)
+                    stream_state["last_emit"] = now
+
         ans = None
         used_tag = "main"                       # 实际答出答案的模型 tag（日志复盘哪个模型救场）
         for tag, pkey, pmodel, purl in providers:
             if tag == "backup":                 # [2026-09-09] 主链路两枪都空才轮询到备用：提示切换
                 ui("status", "🔁 主视觉模型没答出，自动切换备用模型重看中…")
+            prefix = "（备用视觉模型作答）\n" if tag == "backup" else ""
             ans, st = _ask_vision_retry(pkey, pmodel, purl, parts, prompt,
-                                        profiles.ACTIVE.vision_max_tokens)
+                                        profiles.ACTIVE.vision_max_tokens,
+                                        deadline=deadline,
+                                        on_chunk=lambda text, p=prefix:
+                                        emit_stream(text, p))
             if ans:
                 if tag == "backup":             # 备用整图直接答出：答案带前缀，用户可感知救场
                     ans = f"（备用视觉模型作答）\n{ans}"
@@ -261,7 +402,10 @@ def do_vision(ui, prompt_store=None):
             ui("status", "🔍 整图没认出，放大题目重看中…")
             zoom = _crop_center_zoom(img)
             ans2, st2 = _ask_vision_retry(pkey, pmodel, purl, mem_parts + [zoom],
-                                          prompt, profiles.ACTIVE.vision_max_tokens)
+                                          prompt, profiles.ACTIVE.vision_max_tokens,
+                                          deadline=deadline,
+                                          on_chunk=lambda text:
+                                          emit_stream(text, "（整图没答出，放大重看）\n"))
             if ans2:
                 ans = f"（整图没答出，放大重看）\n{ans2}"
                 used_tag = tag
@@ -294,10 +438,13 @@ def do_vision(ui, prompt_store=None):
                     "memory_generation": mem_generation,
                     "displayed": request_current,
                     "mem_imgs": mem_n, "mem_ans": current_mem_ans,
+                    "timeout_sec": timeout_seconds,
                     "api_sec": round(_time.time() - t0, 2)})
     except Exception as e:
         # 2026-09-12 起落盘：原只弹状态栏，静默启动下「识图失败」在日志里零痕迹
         log_event({"type": "vision_error", "err": f"{type(e).__name__}: {e}"[:200]})
-        ui("status", f"❌ 识图异常: {e}")
+        message = f"❌ 识图异常: {e}"
+        ui("vision_abort", message)
+        ui("status", message)
     finally:
         VISION_STATE["busy"] = False
