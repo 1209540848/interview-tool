@@ -42,12 +42,14 @@ class ChatAgent:
     """OpenAI 兼容 API 问答。历史保留最近 HISTORY_TURNS 轮（追问承接）；
     作废轮（新语音打断）通过 drop_last_pair 从历史移除。串行调用，锁保护。"""
     def __init__(self, api_key, model=DEEPSEEK_MODEL, system_prompt=None,
-                 base_url=DEEPSEEK_URL):
+                 base_url=DEEPSEEK_URL, thinking=None):
         import requests
         self.session = requests.Session()
         self.api_key = api_key
         self.model = model
         self.base_url = base_url
+        thinking = (thinking or "").strip().lower()
+        self.thinking = thinking if thinking in ("enabled", "disabled", "auto") else None
         self.messages = [{"role": "system",
                           "content": system_prompt if system_prompt is not None
                           else profiles.ACTIVE.system_prompt}]
@@ -84,12 +86,15 @@ class ChatAgent:
         with self.lock:
             self._apply_pending_prompt()
             self.messages.append({"role": "user", "content": question})
+            body = {"model": self.model, "messages": self.messages,
+                    "temperature": 0.7, "max_tokens": 4000, "stream": True}
+            if self.thinking:
+                body["thinking"] = {"type": self.thinking}
             resp = self.session.post(
                 self.base_url,
                 headers={"Authorization": f"Bearer {self.api_key}",
                          "Content-Type": "application/json"},
-                json={"model": self.model, "messages": self.messages,
-                      "temperature": 0.7, "max_tokens": 4000, "stream": True},
+                json=body,
                 timeout=(10, 120),
                 stream=True,
             )
