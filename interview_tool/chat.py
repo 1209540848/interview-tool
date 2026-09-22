@@ -7,7 +7,7 @@
 import json
 import threading
 
-from .config import RESUME_FILE, RESUME_MAX_CHARS
+from .config import RESUME_FILE, RESUME_MAX_CHARS, _env_get
 from . import profiles          # quiz/code 基础规则取 ACTIVE；技术场景由调用方注入 PromptStore
 
 # ---------- 默认问答后端：DeepSeek（未配 key 时由 engine 改用主视觉后端） ----------
@@ -16,8 +16,13 @@ DEEPSEEK_MODEL = "deepseek-chat"
 HISTORY_TURNS = 5            # 保留最近 N 轮问答（追问承接；10 轮历史太长会带偏新话题）
 VOICE_ANSWER_STRUCTURE = (
     "回答必须先总后分：开头先用 1—2 句话概括核心结论和关键点，直接回答问题；"
-    "不要从定义、背景或发展过程开始铺垫。随后再按重要性展开原因、步骤、权衡和必要示例。"
-    "简单问题在概括后补充 1—3 个要点即可，不为凑结构扩写。"
+    "不要从定义、背景或发展过程开始铺垫。复杂问题随后按已知条件、关键观察、推导步骤、"
+    "结论依据、方案权衡和必要示例详细展开，让答案可以直接复述并经得起追问；不要输出"
+    "试错草稿或内心摸索。输出使用标准 Markdown：复杂回答用二级标题组织总结和详细说明，"
+    "要点使用列表，代码使用带语言标识的围栏代码块。公式统一使用 Markdown 数学语法："
+    "短公式使用 `$...$`；关键公式和推导步骤分别使用独立的 `$$...$$` 块，每块只放一条"
+    "等式；通式、数值代入和结果分开，随后用列表解释变量、单位和假设，不要把公式塞进"
+    "代码块或表格。简单问题在概括后补充 1—3 个要点即可，不为凑结构扩写。"
 )
 
 def build_system_prompt(prompt_store=None):
@@ -48,6 +53,12 @@ class ChatAgent:
         self.api_key = api_key
         self.model = model
         self.base_url = base_url
+        thinking = _env_get("ANSWER_THINKING").strip().lower()
+        if thinking not in ("", "enabled", "disabled"):
+            print("⚠️ ANSWER_THINKING 仅支持 enabled/disabled，已忽略当前值",
+                  flush=True)
+            thinking = ""
+        self.thinking = thinking
         self.messages = [{"role": "system",
                           "content": system_prompt if system_prompt is not None
                           else profiles.ACTIVE.system_prompt}]
@@ -84,12 +95,15 @@ class ChatAgent:
         with self.lock:
             self._apply_pending_prompt()
             self.messages.append({"role": "user", "content": question})
+            body = {"model": self.model, "messages": self.messages,
+                    "temperature": 0.7, "max_tokens": 4000, "stream": True}
+            if self.thinking:
+                body["thinking"] = {"type": self.thinking}
             resp = self.session.post(
                 self.base_url,
                 headers={"Authorization": f"Bearer {self.api_key}",
                          "Content-Type": "application/json"},
-                json={"model": self.model, "messages": self.messages,
-                      "temperature": 0.7, "max_tokens": 4000, "stream": True},
+                json=body,
                 timeout=(10, 120),
                 stream=True,
             )

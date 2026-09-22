@@ -32,6 +32,32 @@ class PromptStoreTests(unittest.TestCase):
         self.assertNotIn("AI Infra", voice)
         self.assertNotIn("AI Infra", vision)
 
+    def test_general_scene_has_domain_neutral_default_prompts(self):
+        store = PromptStore(self.path)
+
+        self.assertEqual(store.get_active_scene()["id"], "general")
+        voice = store.compose_voice_prompt("voice-base")
+        vision = store.compose_vision_prompt("vision-base")
+        self.assertIn("通用技术面试场景", voice)
+        self.assertIn("通用笔试与代码题场景", vision)
+        self.assertIn("每一步为什么成立", voice)
+        self.assertIn("正确性依据和边界情况", vision)
+        self.assertNotIn("AI Infra", voice + vision)
+        self.assertNotIn("前端场景", voice + vision)
+
+    def test_ai_infra_scene_summarizes_then_derives_quantitatively(self):
+        store = PromptStore(self.path)
+        store.select_scene("ai-infra")
+
+        voice = store.compose_voice_prompt("voice-base")
+        vision = store.compose_vision_prompt("vision-base")
+        self.assertIn("核心判断和推荐方案，再详细推导", voice)
+        self.assertIn("公式、量纲、关键步骤", voice)
+        self.assertIn("每块一条等式", voice)
+        self.assertIn("先概括最终判断、瓶颈或所用方案", vision)
+        self.assertIn("代入步骤、单位和边界条件", vision)
+        self.assertIn("Markdown 数学语法", vision)
+
     def test_builtin_edits_persist_and_can_be_reset(self):
         store = PromptStore(self.path)
         store.save_scene("frontend", {

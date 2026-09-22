@@ -83,6 +83,56 @@ class ChatAgentEndpointTests(unittest.TestCase):
         self.assertEqual(requested["url"], "https://vision.example/chat/completions")
         self.assertEqual(requested["kwargs"]["json"]["model"], "vision-model")
 
+    def test_answer_thinking_is_sent(self):
+        requested = {}
+
+        class FakeResponse:
+            def raise_for_status(self):
+                pass
+
+            def iter_lines(self):
+                return iter([b"data: [DONE]"])
+
+            def close(self):
+                pass
+
+        class FakeSession:
+            def post(self, _url, **kwargs):
+                requested.update(kwargs)
+                return FakeResponse()
+
+        with patch("interview_tool.chat._env_get", return_value="disabled"):
+            agent = ChatAgent("key", system_prompt="system")
+        agent.session = FakeSession()
+        agent.ask_stream("question")
+
+        self.assertEqual(requested["json"]["thinking"], {"type": "disabled"})
+
+    def test_answer_thinking_is_omitted_when_unset(self):
+        requested = {}
+
+        class FakeResponse:
+            def raise_for_status(self):
+                pass
+
+            def iter_lines(self):
+                return iter([b"data: [DONE]"])
+
+            def close(self):
+                pass
+
+        class FakeSession:
+            def post(self, _url, **kwargs):
+                requested.update(kwargs)
+                return FakeResponse()
+
+        with patch("interview_tool.chat._env_get", return_value=""):
+            agent = ChatAgent("key", system_prompt="system")
+        agent.session = FakeSession()
+        agent.ask_stream("question")
+
+        self.assertNotIn("thinking", requested["json"])
+
     def test_scheduled_prompt_resets_history_on_next_question(self):
         sent_messages = []
 
@@ -127,8 +177,17 @@ class VoicePromptStructureTests(unittest.TestCase):
 
         self.assertIn("回答必须先总后分", prompt)
         self.assertIn("开头先用 1—2 句话概括核心结论和关键点", prompt)
-        self.assertIn("随后再按重要性展开", prompt)
+        self.assertIn("关键观察、推导步骤", prompt)
+        self.assertIn("经得起追问", prompt)
+        self.assertIn("标准 Markdown", prompt)
+        self.assertIn("每块只放一条等式", prompt)
         self.assertNotIn("回答必须先总后分", profiles.CODE.vision_prompt)
+        self.assertIn("## 结论", profiles.CODE.vision_prompt)
+        self.assertIn("## 详细思路", profiles.CODE.vision_prompt)
+        self.assertIn("## 代码", profiles.CODE.vision_prompt)
+        self.assertIn("正确性依据", profiles.CODE.vision_prompt)
+        self.assertIn("通式、代入、结果分别使用独立", profiles.CODE.vision_prompt)
+        self.assertNotIn("【结论】", profiles.CODE.vision_prompt)
 
 
 class PermanentCaptureExclusionTests(unittest.TestCase):

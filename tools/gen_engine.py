@@ -11,10 +11,11 @@ engine.py = code 版主逻辑（行为主本）+ 登记点编辑：
   (f) ESC 单按块：quiz 分支（原文：单按即退）+ code 分支（原文：0.8s 内双按才退）
   (g) 识图/注入分歧段 → if profile.key == "quiz": <quiz 原文整段> else: <code 原文整段>
       （两段文本各自从对应单体原行切片，程序化缩进）
-  (h) 就绪横幅两处 print(多行常量) → print(profiles.ACTIVE.banner_auto/manual, flush=True)
+  (h) 就绪横幅按当前快捷键配置动态生成
   (i) 问答后端选择：DEEPSEEK_API_KEY 优先；未配置时复用主视觉模型三件套
   (j) 移除 F7 防捕获开关；防捕获由 state 固定常驻开启
   (k) 注入单活动 PromptStore：设置窗口切场景、语音下一题换 system、截图按场景快照
+  (l) 硬编码热键轮询替换为 HotkeyBindings / HotkeyRuntime（.env 可重绑）
 
 所有点编辑的缩进一律从锚点行推导（不硬编码列号）；每个编辑的目标文本都做内容断言，
 源文件漂移即中止 → 生成器可放心重跑。引擎自身除 profile.key 分叉外零场景判断——
@@ -262,7 +263,7 @@ def main():
         "def main(profile):",
         "    profiles.ACTIVE = profile        # flavor 激活：分叉段与 ACTIVE.* 字段取用（run_quiz/run_code 传入）",
         "    prompt_store = PromptStore()     # 技术场景独立于 quiz/code；任意时刻只激活一个",
-        "    # 打字实现注入：quiz 裸 1 走简化打字（原文语义）；code Alt+1 走 _after_alt_release 包 code 版",
+        "    # 打字实现注入：quiz/code 保留各自的前台输入策略，按键与松键等待由 hotkeys 统一处理。",
         "    type_answer_into_foreground = (typing_quiz.type_answer_into_foreground",
         "                                   if profile.key == \"quiz\"",
         "                                   else typing_code.type_answer_into_foreground)",
@@ -325,6 +326,82 @@ def main():
         '                    ui("vision_reset")               # 清掉当前显示/旧答案待输入态，历史仍可回看',
     ]
 
+    # (l) 统一可配置热键。旧单体里的硬编码轮询仍作为生成输入锚点，但不进入产物。
+    hotkey_head = body_find("    # 热键轮询（GetAsyncKeyState")
+    hotkey_tail = body_find("    threading.Thread(target=hotkey_loop, daemon=True).start()")
+    body[hotkey_head:hotkey_tail + 1] = [
+        "    # 所有快捷键统一从 .env 解析；默认值保持旧行为。",
+        "    hotkey_runtime = HotkeyRuntime(",
+        "        bindings=hotkeys, profile_key=profile.key, manual=args.manual,",
+        "        root=root, ui=ui, set_status=set_status, state=state,",
+        "        state_lock=st_lock, epoch=epoch, recorder_loop=recorder_loop,",
+        "        recorder_mic=recorder_mic,",
+        "        event_q=event_q if not args.manual else None,",
+        "        attach_on=attach_on if not args.manual else None,",
+        "        prompt_store=prompt_store, type_answer=type_answer_into_foreground,",
+        "        paste_answer=paste_answer_into_foreground, do_vision=do_vision,",
+        "        reset_vision=_vis_mem_reset, save_geometry=save_window_geometry,",
+        "        manual_handler=_manual_go,",
+        "    )",
+        "    threading.Thread(target=hotkey_runtime.run, daemon=True).start()",
+    ]
+
+    acrylic_line = body_find('    CHAMELEON["on"] = args.chameleon') + 1
+    body[acrylic_line:acrylic_line] = [
+        "    hotkeys = HotkeyBindings(profile.key)",
+        '    profiles.ACTIVE.vision_retry = hotkeys.label("vision")',
+        "    for warning in hotkeys.warnings:",
+        '        print(f"⚠️ 快捷键配置: {warning}", flush=True)',
+    ]
+
+    crash_comment = body_find("    # 崩溃兜底：hidden-start")
+    body[crash_comment] = body[crash_comment].replace(
+        "logs/cheat-crash.log", "logs/interview-crash.log")
+    crash_path = body_find('"cheat-crash.log"')
+    body[crash_path] = body[crash_path].replace(
+        '"cheat-crash.log"', '"interview-crash.log"')
+
+    state_line = body_find('    state = {"mode": "listen", "paused": False')
+    body[state_line:state_line + 1] = [
+        "    # 手动模式默认全听，让 F1/F2 同时收回环和麦克风；F10 仍可切到只听。",
+        '    state = {"mode": "full" if args.manual else "listen",',
+        '             "paused": False, "tp": False}   # listen=只听 / full=全听 / tp=提词器',
+    ]
+
+    force_mic_print = body_find('print("🎤 F9 按住：强制收录你的声音"')
+    force_mic_pad = " " * ind_of(body[force_mic_print])
+    body[force_mic_print:force_mic_print + 1] = [
+        force_mic_pad + 'print(f"🎤 {hotkeys.label(\'force_mic\')} 按住：强制收录你的声音",',
+        force_mic_pad + "      flush=True)",
+    ]
+
+    prompt_log_tail = body_find('               "scene_name": active_scene["name"], "reason": "session_start"})') + 1
+    body[prompt_log_tail:prompt_log_tail] = [
+        '    log_event({"type": "hotkeys", "profile": profile.key,',
+        '               "bindings": hotkeys.labels(), "warnings": hotkeys.warnings})',
+    ]
+
+    ui_call = body_find("                                  on_prompt_apply=on_prompt_apply)")
+    body[ui_call:ui_call + 1] = [
+        "                                  on_prompt_apply=on_prompt_apply,",
+        "                                  hotkey_labels=hotkeys.labels())",
+    ]
+
+    startup_comment = body_find("    # 启动：录音流常开")
+    startup_tail = body_find('    print("=" * 50, flush=True)')
+    body[startup_comment:startup_tail] = [
+        "    # 启动：录音流常开（F1/F2 控制攒与不攒）；防捕获与手机推送常驻开",
+        "    recorder_loop.start()",
+        "    if recorder_mic:",
+        "        recorder_mic.start()   # 自动模式常开；手动模式默认全听，F1/F2 同时收两轨",
+        "    print(hotkeys.banner(args.manual), flush=True)",
+        "    if not args.manual:",
+        '        set_status("🕶️ 防捕获开 · 📱 推送开 · 自动模式")',
+        "    else:",
+        '        set_status("🕶️ 防捕获开 · 📱 推送开 · 手动全听模式 · "',
+        '                   f"{hotkeys.label(\'toggle_mode\')}切换")',
+    ]
+
     PRELUDE = '''# -*- coding: utf-8 -*-
 """engine.py — 统一编排主本（quiz 测评版 / code 笔试版共享一份 main）。
 
@@ -336,7 +413,6 @@ def main():
 interview_tool 内各模块。属主规则（R1/R2）与差异收容表见 profiles.py docstring。
 """
 import argparse
-import ctypes
 import os
 import queue
 import sys
@@ -359,12 +435,13 @@ from .config import (AUTO_ATTACH_ON, B_TRIGGER_SEC, BLOCK,
                      MY_ANSWER_MAX_CHARS, MY_ANSWER_TEXT_MAX, MY_BATCH_SEC,
                      SAMPLE_RATE, _env_get)
 from .dsp import GateState, SpeechDetector
+from .hotkeys import HotkeyBindings, HotkeyRuntime
 from .log import log_event
 from .prompt_store import PromptStore
 from .push import push_answer
 from .state import (ACRYLIC, CHAMELEON, TYPING_STATE, VISION_STATE, push_on,
                     stealth)
-from .typing_code import _after_alt_release, paste_answer_into_foreground
+from .typing_code import paste_answer_into_foreground
 from .ui import hist, load_history_from_logs, save_window_geometry, \\
     show_answer_window
 from .vision import _vis_mem_reset, _vision_providers, do_vision
