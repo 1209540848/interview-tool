@@ -283,7 +283,9 @@ def show_answer_window(ui_q, prompt_store=None, on_prompt_apply=None,
     root.after(300, _keep_ontop)
 
     # ---------- 变色龙模式（--chameleon）：200ms 吸色 + 亮度公式自动深浅文字 ----------
-    cm = {"prev": None}     # 上一帧颜色（EMA 平滑用）
+    cm = {"prev": None, "shown": None, "applied": None}
+    # prev=上一帧采样（EMA 平滑用）；shown=已应用的量化色（死区判定用）；
+    # applied=上次真正下发到控件的 (bg,fg,...) 元组（相同则整轮跳过，防 5Hz 空重绘）
     if CHAMELEON["on"]:
         def _sample_band():
             """采窗口外缘外侧一条像素带的平均色（避开自己窗口，防反馈循环）"""
@@ -315,6 +317,15 @@ def show_answer_window(ui_q, prompt_store=None, on_prompt_apply=None,
                             rgb = prev
                         else:
                             rgb = tuple((rgb[i] // 8) * 8 for i in range(3))
+                            # 死区（2026-09-23 实测修复）：采样均值在量化台阶边界附近摆动
+                            # 时，量化结果会在相邻两色（如 192↔200）之间每 200ms 翻一次，
+                            # 整窗 62% 像素以 5Hz 同闪——这就是「笔记/回答一直抖动」的真根因。
+                            # 与「已应用的色」相差不足 2 个台阶（16）就不切色。
+                            shown = cm["shown"]
+                            if shown and max(abs(rgb[i] - shown[i]) for i in range(3)) < 16:
+                                rgb = shown
+                            else:
+                                cm["shown"] = rgb
                     cm["prev"] = rgb
                     lum = 0.299 * rgb[0] + 0.587 * rgb[1] + 0.114 * rgb[2]
                     light = lum > 145
@@ -326,6 +337,12 @@ def show_answer_window(ui_q, prompt_store=None, on_prompt_apply=None,
                                      for c in rgb)
                     code_bg = _hex(code_rgb)
                     bg = _hex(rgb)
+                    # 颜色没变 → 本轮一个控件、一个 tag 都不碰（config/tag_configure 即使
+                    # 传相同值 Tk 也会重排重绘：200ms × 十余个控件 = 整窗持续刷，肉眼即抖）
+                    target = (bg, fg, muted, accent, warm, code_bg)
+                    if cm["applied"] == target:
+                        root.after(200, chameleon_tick)
+                        return
                     ui_theme.update(bg=bg, fg=fg, muted=muted, accent=accent)
                     root.configure(bg=bg)
                     a_text.config(bg=bg, fg=fg)
@@ -347,6 +364,7 @@ def show_answer_window(ui_q, prompt_store=None, on_prompt_apply=None,
                         note_list.config(bg=bg, fg=muted, selectbackground=code_bg,
                                          selectforeground=accent)
                         _style_tabs(bg, fg, accent, muted)
+                    cm["applied"] = target      # 全套下发成功才记账；中途异常则下次重试
             except Exception:
                 pass
             root.after(200, chameleon_tick)
