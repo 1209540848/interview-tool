@@ -47,6 +47,38 @@ interview-tool/
 - **code 笔记专区**：悬浮窗顶部通过「回答 / 笔记」按钮切换；笔记页递归读取 `notes/` 下的 Markdown，只在本地展示，不发送给模型。
 - 防捕获常驻开启：共享屏幕/录屏时答案窗从捕获画面消失，不提供关闭热键。
 
+## 会话数据
+
+每次启动都会建立一个不会复用的独立会话目录；同一秒启动多个进程也会通过毫秒、进程号
+和冲突序号分开。每次模型或 ASR 请求再建立自己的 `request-*` 子目录：
+
+```text
+logs/session-20260919-120000-123-p4567/
+├─ events.jsonl          # 本次启动的完整事件日志
+├─ requests.jsonl        # 请求目录索引
+├─ transcripts.jsonl     # 本次启动的语音转录索引
+├─ audio/                # 自动模式整场 interviewer.wav / me.wav
+├─ request-0001-auto-question/
+│  ├─ request.json       # 请求类型、模型、触发方式和状态
+│  ├─ input.wav          # 本次实际送入 ASR 的 16k 音频
+│  ├─ transcript.json    # 本次语音转录
+│  └─ response.md        # 问答模型最终回答
+└─ request-0002-vision/
+   ├─ request.json       # Prompt、模型、历史图片数和耗时
+   ├─ screenshot.jpg     # 本次实际送入视觉模型的截图
+   └─ response.md        # 视觉模型最终回答
+```
+
+手动模式的请求目录会分别保存 `loop.wav`、`mic.wav` 和实际送入 ASR 的 `input.wav`；
+自动模式除整场双轨外，还会为每次问题和本人回答建立独立请求目录。
+这些文件只保存在本机，`logs/` 已被 Git 忽略。可在 `.env` 中分别关闭：
+
+```dotenv
+SAVE_SCREENSHOTS=true
+SAVE_AUDIO=true
+SAVE_TRANSCRIPTS=true
+```
+
 ## 热键速查（以下为 code 版默认值，quiz 版默认值见 `hotkeys.py`）
 
 ```
@@ -91,6 +123,7 @@ CODE_HOTKEY_TOGGLE_WINDOW=F7
 - `VISION_TIMEOUT_SECONDS` — 单次截图任务的总等待上限，默认 `120` 秒；长推理可设为 `240`
 - `DEEPSEEK_API_KEY` — 可选；配置后语音问答使用 DeepSeek，留空则复用上述主视觉模型
 - `ANSWER_THINKING` — 问答模型思考开关，支持 `enabled` / `disabled`；留空使用模型默认值
+- `SAVE_SCREENSHOTS` / `SAVE_AUDIO` / `SAVE_TRANSCRIPTS` — 本地会话数据开关，默认开启
 - `BOT_TOKEN` / `ALLOWED_IDS` / `PROXY` — Telegram 推送
 - `ISI_APPKEY` / `ALIYUN_AK_ID` / `ALIYUN_AK_SECRET` / `DASHSCOPE_API_KEY` — 转写/备用 ASR（可选）
 
@@ -150,7 +183,7 @@ python run_code.py --manual
 python run_code.py --manual --chameleon
 ```
 
-或双击对应 `.vbs`（静默启动）。会话日志落 `logs/session-*.jsonl`（`.gitignore`）。
+或双击对应 `.vbs`（静默启动）。会话数据全部落在 `logs/session-*/`（`.gitignore`）。
 
 ## 开发
 
