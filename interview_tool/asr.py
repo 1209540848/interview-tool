@@ -92,7 +92,12 @@ def isi_transcribe(audio, appkey, ak_id, ak_secret, timeout=60):
         sentences, final = [], ""
         headers = {"X-NLS-Token": token}
         ws = await _ws_connect(ISI_WS_URL, headers, max_size=4 * 1024 * 1024)
-        async with ws:
+        # 不能用 `async with ws:`：websockets ≤13 的 connect 是 legacy 实现，await
+        # 之后拿到的是 WebSocketClientProtocol，它没有 __aenter__ —— 直接抛
+        # "does not support the asynchronous context manager protocol"（2026-09-19
+        # 实测转写 11/11 全挂的根因）。只有「未 await 的 Connect 对象」和 14+ 的
+        # ClientConnection 才支持 async with。这里手动 try/finally 关连接。
+        try:
             start = {
                 "header": {"message_id": uuid.uuid4().hex, "task_id": uuid.uuid4().hex,
                            "namespace": "SpeechTranscriber", "name": "StartTranscription",
@@ -134,6 +139,11 @@ def isi_transcribe(audio, appkey, ak_id, ak_secret, timeout=60):
                     break
                 elif name == "TaskFailed":
                     raise RuntimeError((ev.get("header") or {}).get("status_text") or "ISI failed")
+        finally:
+            try:
+                await ws.close()
+            except Exception:
+                pass
         return "".join(sentences) or final
 
     return asyncio.run(_run()).strip()
@@ -149,7 +159,8 @@ def cloud_transcribe(audio, api_key, timeout=60):
         sentences, final = [], ""
         headers = {"Authorization": f"bearer {api_key}"}
         ws = await _ws_connect(DASHSCOPE_WS_URL, headers, max_size=4 * 1024 * 1024)
-        async with ws:
+        try:  # 同 isi_transcribe：legacy 协议不支持 async with，手动关连接
+
             await ws.send(json.dumps({
                 "header": {"action": "run-task", "task_id": task_id, "streaming": "duplex"},
                 "payload": {"task_group": "audio", "task": "asr",
@@ -183,6 +194,11 @@ def cloud_transcribe(audio, api_key, timeout=60):
                     break
                 elif event == "task-failed":
                     raise RuntimeError(hdr.get("error_message") or "ASR failed")
+        finally:
+            try:
+                await ws.close()
+            except Exception:
+                pass
         return "".join(sentences) or final
 
     return asyncio.run(_run()).strip()
