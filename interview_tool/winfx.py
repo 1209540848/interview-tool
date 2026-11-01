@@ -64,6 +64,25 @@ def set_capture_excluded(root, exclude):
         print(f"⚠️ 防捕获设置失败: {e}", flush=True)
         return False
 
+def set_window_minimized(root, minimized):
+    """系统级最小化/恢复答案窗（F4）。
+    坑：overrideredirect(True) 的窗口调 root.iconify() 会直接抛
+    TclError: can't iconify ".": override-redirect flag is set，
+    只能走 Win32 ShowWindow(SW_MINIMIZE/SW_RESTORE)。
+    最小化后 Tk state() 返回 iconic，_keep_ontop 会自然停摆。返回是否成功。"""
+    try:
+        user32 = ctypes.windll.user32
+        user32.GetAncestor.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+        user32.GetAncestor.restype = ctypes.c_void_p
+        user32.ShowWindow.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        top = user32.GetAncestor(root.winfo_id(), 2) or root.winfo_id()   # GA_ROOT 拿顶层窗口
+        SW_MINIMIZE, SW_RESTORE = 6, 9
+        user32.ShowWindow(top, SW_MINIMIZE if minimized else SW_RESTORE)
+        return True
+    except Exception as e:
+        print(f"⚠️ 窗口最小化/恢复失败: {e}", flush=True)
+        return False
+
 def set_no_activate(root):
     """给答案窗挂 WS_EX_NOACTIVATE：窗口永不激活、点它也不抢焦点。
     测评/笔试页面监听 blur 记「离开页面」——答案窗每次被激活(点击/lift 瞬间)

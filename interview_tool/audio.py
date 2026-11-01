@@ -39,7 +39,7 @@ class Recorder:
       - on_block(block)：16k float32 块 → 编排线程（门控仲裁 + VAD）
       - _raw：原生格式 int16 块（设备采样率/声道原样）→ WavWriter 落盘（复盘要真相）
     callback 只做最小工作：不阻塞、不文件IO、不 print、异常全吞不 return paComplete（不杀流）。
-    流常开不关；_rec/_bufs 保留 F1 手动兜底（攒 16k float32 整段）。"""
+    流常开不关；_rec/_bufs 保留 Alt+F1 手动兜底（攒 16k float32 整段）。"""
     def __init__(self, p, device_idx, device, on_block=None, mode="cb",
                  capture_raw=True):
         self.p = p
@@ -53,7 +53,7 @@ class Recorder:
         self._stop = threading.Event()
         self._lock = threading.Lock()
         self._raw = []                  # 原生 int16 块（落盘；writer 线程 take_raw 取走）
-        self._rec = False               # F1 后 True：回调往 _bufs 里攒
+        self._rec = False               # Alt+F1 后 True：回调往 _bufs 里攒
         self._bufs = []
         self._fmt = None                # 数据格式探测结果（'f32'/'i16'），首块定
         self._sr = 44100                # 默认值兜底：tcp 模式 start() 跳过不设置，
@@ -110,13 +110,13 @@ class Recorder:
                 time.sleep(w)
 
     def start_rec(self):
-        """F1 手动兜底：开始攒（清掉上一轮残留，防误拼）"""
+        """Alt+F1 手动兜底：开始攒（清掉上一轮残留，防误拼）"""
         with self._lock:
             self._bufs = []
             self._rec = True
 
     def stop_rec(self):
-        """F1 手动兜底：停止并取走攒的 16k float32 块（没录到返回空列表）"""
+        """Alt+F1 手动兜底：停止并取走攒的 16k float32 块（没录到返回空列表）"""
         with self._lock:
             self._rec = False
             bufs, self._bufs = self._bufs, []

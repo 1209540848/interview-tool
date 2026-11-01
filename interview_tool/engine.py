@@ -29,8 +29,9 @@ from .config import (AUTO_ATTACH_ON, B_TRIGGER_SEC, BLOCK,
                      ESCAPE_COOLDOWN, GATE_ESCAPE_ABS, GATE_ESCAPE_RATIO,
                      GATE_RECYCLE_SEC, LOG_DIR, MIN_UTTERANCE_SEC,
                      MY_ANSWER_MAX_CHARS, MY_ANSWER_TEXT_MAX, MY_BATCH_SEC,
-                     SAMPLE_RATE, _env_get)
+                     SAMPLE_RATE, _env_bool, _env_get)
 from .dsp import GateState, SpeechDetector
+from .helper_link import HelperLink
 from .hotkeys import HotkeyBindings, HotkeyRuntime
 from .log import log_event
 from .prompt_store import PromptStore
@@ -91,7 +92,7 @@ def main(profile):
     ap.add_argument("--acrylic", action="store_true", help="磨砂玻璃背景（DWM Acrylic）替代灰色实底")
     ap.add_argument("--chameleon", action="store_true", help="变色龙背景：吸窗口下方屏幕颜色，文字自动深浅")
     ap.add_argument("--manual", action="store_true",
-                    help="手动模式（F1 开始/F2 结束定界，旧版行为；默认自动模式双轨全程录音）")
+                    help="手动模式（Alt+F1 开始/Alt+F2 结束定界，旧版行为；默认自动模式双轨全程录音）")
     ap.add_argument("--mic-device", type=int, default=None,
                     help="麦克风设备索引（默认取系统默认输入；装虚拟声卡测试时指定）")
     ap.add_argument("--loop-device", type=int, default=None,
@@ -154,7 +155,7 @@ def main(profile):
     sys.excepthook = _crash_hook
 
     # 全局状态 + UI 事件队列
-    # 手动模式默认全听，让 F1/F2 同时收回环和麦克风；F10 仍可切到只听。
+    # 手动模式默认全听，让 Alt+F1/Alt+F2 同时收回环和麦克风；F10 仍可切到只听。
     state = {"mode": "full" if args.manual else "listen",
              "paused": False, "tp": False}   # listen=只听 / full=全听 / tp=提词器
     epoch = {"n": 0}            # 每检测到新语音 +1；答案回来时序号不符 → 作废
@@ -163,7 +164,7 @@ def main(profile):
     ui_q = queue.Queue()
 
     def ui(kind, payload=None):
-        # payload 可省略（F1 热键传单参 "mini"，poll 里按当前状态取反）
+        # payload 可省略（Alt+F1 热键传单参 "mini"，poll 里按当前状态取反）
         ui_q.put((kind, payload))
 
     def set_status(text):
@@ -188,11 +189,83 @@ def main(profile):
         ui("status", f"🎯 场景已切换：{scene['name']} · 下一题生效")
         print(f"🎯 Prompt 场景已切换: {scene['name']}（下一题生效）", flush=True)
 
+    # 局域网互助：本机起一个 HTTP 中继，朋友手机浏览器打开链接即可收发。
+    # 默认开启；HELPER_LAN=false 或端口/单实例锁失败时静默降级（不影响答题主链路）。
+    helper = None
+    if _env_bool("HELPER_LAN", True):
+        try:
+            helper = HelperLink(on_answer=lambda rec: ui("helper_answer", rec))
+            helper.start()
+            print(f"👥 互助链路: {helper.url}", flush=True)
+            print("   手机浏览器打开上面链接（同一 Wi-Fi / Tailscale），F7 开关", flush=True)
+        except Exception as exc:
+            print(f"⚠️ 互助链路未启动: {exc}", flush=True)
+            helper = None
+
     root = None
+
+    def send_helper_shot():
+        """截图并推给朋友：复用 Alt+P 的离场手法，避免答案窗被截进图。"""
+        if helper is None or not helper.running:
+            ui("status", "👥 互助未开启")
+            return
+        if not _env_bool("HELPER_SEND_SHOT", True):
+            ui("status", "📸 截图推送已在 .env 关闭")
+            return
+        if root is None:
+            ui("status", "👥 无窗口可截图")
+            return
+
+        def work():
+            try:
+                ui("ov_ctl", "hide")
+                time.sleep(0.35)             # 等主线程先处理 hide，再抓屏
+                from PIL import Image, ImageGrab
+                import io
+                img = ImageGrab.grab()
+                width, height = img.size
+                if width > 1600:             # 手机端看长图：限宽 1600，压到几百 KB
+                    img = img.resize(
+                        (1600, max(1, int(height * 1600 / width))),
+                        Image.LANCZOS)
+                buf = io.BytesIO()
+                img.convert("RGB").save(buf, "JPEG", quality=78)
+                event = helper.publish_screenshot(buf.getvalue())
+                if event is not None:
+                    ui("status", "📸 截图已发给朋友")
+            except Exception as exc:
+                print(f"⚠️ 互助截图失败: {exc}", flush=True)
+                ui("status", f"⚠️ 截图失败: {exc}")
+            finally:
+                ui("ov_ctl", "restore")
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def type_helper_answer():
+        """Alt+5：把最近一条朋友回复打进当前焦点框（同 Alt+1 的逐字注入）。"""
+        if helper is None:
+            return
+        rec = helper.latest_answer()
+        text = str((rec or {}).get("text") or "").strip()
+        if not text:
+            ui("status", "👤 还没有朋友回复")
+            return
+        type_answer_into_foreground(text)
+
+    def publish_helper_question(text):
+        if helper is None:
+            return
+        try:
+            helper.publish_question(text)
+        except Exception as exc:
+            log_event({"type": "helper_publish_fail", "err": str(exc)[:200]})
+
     if not args.no_window:
         root = show_answer_window(ui_q, prompt_store=prompt_store,
                                   on_prompt_apply=on_prompt_apply,
-                                  hotkey_labels=hotkeys.labels())
+                                  hotkey_labels=hotkeys.labels(),
+                                  helper=helper,
+                                  on_helper_shot=send_helper_shot)
         set_capture_excluded(root, stealth["on"])   # 防捕获常驻开启
 
     if not args.no_inject:
@@ -274,9 +347,9 @@ def main(profile):
     if agent is not None:
         threading.Thread(target=answer_worker, daemon=True).start()
 
-    # 手动录音链路（F1 开始攒、F2 结束转写 → 提问上屏 → 生成回答）
+    # 手动录音链路（Alt+F1 开始攒、Alt+F2 结束转写 → 提问上屏 → 生成回答）
     def _manual_go(loop_bufs, mic_bufs):
-        """F2 结束录音后：双轨对齐混音 → 保存 → 转写 → 提问上屏。"""
+        """Alt+F2 结束录音后：双轨对齐混音 → 保存 → 转写 → 提问上屏。"""
         try:
             with st_lock:
                 include_mic = state["mode"] == "full"
@@ -328,6 +401,7 @@ def main(profile):
         log_event({"type": "question", "source": "手动", "text": text,
                    "seq": seq, "audio": audio_path, "request_id": request_id})
         ui("q", text)                       # 提问先上屏（用户先确认录到了什么）
+        publish_helper_question(text)       # 同步给浏览器端朋友（互助面板）
         if args.no_inject:
             print(f"🔇 [no-inject] {text}", flush=True)
             return
@@ -519,6 +593,7 @@ def main(profile):
                                "audio_sec": round(len(job[1]) / SAMPLE_RATE, 1)})
                     print(f"✍️ 问题（{job[2]}）: {text}", flush=True)
                     ui("q", text)
+                    publish_helper_question(text)
                     answer_q.put((text, seq, job[2], request_id))
                 else:
                     storage.save_transcript(
@@ -611,15 +686,16 @@ def main(profile):
         paste_answer=paste_answer_into_foreground, do_vision=do_vision,
         reset_vision=_vis_mem_reset, save_geometry=save_window_geometry,
         manual_handler=_manual_go, shutdown_event=shutdown_event,
+        helper=helper, helper_type_answer=type_helper_answer,
     )
     threading.Thread(target=hotkey_runtime.run, daemon=True).start()
 
-    # 启动：录音流常开（F1/F2 控制攒与不攒）；防捕获与手机推送常驻开
+    # 启动：录音流常开（Alt+F1/Alt+F2 控制攒与不攒）；防捕获与手机推送常驻开
     try:
         recorder_loop.start()
         if recorder_mic:
             recorder_mic.start()   # 自动模式常开；手动模式默认全听，F1/F2 同时收两轨
-        print(hotkeys.banner(args.manual), flush=True)
+        print(hotkeys.banner(args.manual, helper=helper is not None), flush=True)
         if not args.manual:
             set_status("🕶️ 防捕获开 · 📱 推送开 · 自动模式")
         else:
@@ -638,6 +714,8 @@ def main(profile):
     finally:
         if not shutdown_event.is_set():
             log_event({"type": "session_end", "reason": "正常退出"})
+        if helper is not None:
+            helper.stop()
         recorder_loop.stop()
         if recorder_mic:
             recorder_mic.stop()

@@ -41,7 +41,9 @@ class HotkeyConfigurationTests(unittest.TestCase):
     def test_profile_defaults_are_preserved(self):
         quiz = HotkeyBindings("quiz", env_get=_env({}), reader=lambda _key: False)
         code = HotkeyBindings("code", env_get=_env({}), reader=lambda _key: False)
-        self.assertEqual(quiz.label("vision"), "F3 / P")
+        self.assertEqual(quiz.label("record_start"), "Alt+F1")
+        self.assertEqual(quiz.label("record_stop"), "Alt+F2")
+        self.assertEqual(quiz.label("vision"), "Alt+F3 / Alt+P")
         self.assertEqual(quiz.label("type_answer"), "1")
         self.assertEqual(code.label("vision"), "Alt+P")
         self.assertEqual(code.label("type_answer"), "Alt+1")
@@ -120,19 +122,11 @@ class HotkeyRuntimeTests(unittest.TestCase):
         class FakeRoot:
             _user_hidden = False
 
-            def __init__(self):
-                self.withdraw_count = 0
-
-            def withdraw(self):
-                self.withdraw_count += 1
-
-            def deiconify(self):
-                raise AssertionError("first toggle should hide the window")
-
         root = FakeRoot()
+        ui_calls = []
         runtime = HotkeyRuntime(
             bindings=FakeBindings(), profile_key="code", manual=True,
-            root=root, ui=lambda *_args: None, set_status=lambda _text: None,
+            root=root, ui=ui_calls.append, set_status=lambda _text: None,
             state={"mode": "full", "paused": False},
             state_lock=threading.Lock(), epoch={"n": 0},
             recorder_loop=None, recorder_mic=None, event_q=None,
@@ -147,8 +141,8 @@ class HotkeyRuntimeTests(unittest.TestCase):
              self.assertRaises(StopLoop):
             runtime.run()
 
-        self.assertTrue(root._user_hidden)
-        self.assertEqual(root.withdraw_count, 1)
+        # 窗口操作由主线程处理：热键线程只投 ui 队列（Tk 非线程安全）
+        self.assertEqual(ui_calls, ["mini_toggle"])
 
 
 if __name__ == "__main__":

@@ -19,6 +19,7 @@ interview-tool/
 │  ├─ engine.py                # 统一编排主本（由 tools/gen_engine.py 从旧 code 版 main 生成）
 │  ├─ config.py log.py state.py dsp.py audio.py asr.py chat.py
 │  ├─ winfx.py vision.py typing_quiz.py typing_code.py push.py ui.py
+│  ├─ helper_link.py helper_page.py  # 局域网互助中继 + 手机端网页
 │  ├─ prompt_presets.py prompt_store.py prompt_settings.py  # 单选技术场景
 ├─ notes/                      # code 版只读笔记专区（支持多个 Markdown 和子目录）
 ├─ interview-tool-api.py      # 遗留单文件 API 版（独立演进）
@@ -33,7 +34,7 @@ interview-tool/
 
 | 文件 | 版本 | 用途 |
 |---|---|---|
-| `run_quiz.py` | 测评版入口 | 行测/性格测评/选择题：`P`/`F3` 截屏走「测评快答」模板（直接给选项+一句话理由），`max_tokens` 更小、只求快；ESC 单按即退 |
+| `run_quiz.py` | 测评版入口 | 行测/性格测评/选择题：`Alt+F3`/`Alt+P` 截屏走「测评快答」模板（直接给选项+一句话理由），`max_tokens` 更小、只求快；ESC 单按即退 |
 | `run_code.py` | 笔试版入口 | 手撕代码/算法题：`Alt+P` 截屏识图走「详解」模板（思路/代码/复杂度），`Alt+1` 自动打字进答题框、`Alt+2` 粘贴、`Alt+3` 清识图多轮记忆；ESC 0.8s 内双按才退 |
 | `interview-tool-api.py` | 祖本 | 通用分支（不再直接跑），功能与 quiz 版相当（P/F3 识图，无 Alt+ 方案） |
 | `hidden-start-quiz.vbs` / `hidden-start-code.vbs` / `hidden-start-chameleon.vbs` | 启动器 | 静默启动（`--chameleon` 无控制台闪窗） |
@@ -44,8 +45,17 @@ interview-tool/
 - **测评/笔试快答**：截图当前题 → 视觉模型流式生成标准 Markdown 答案 → 答案窗同步渲染标题、列表与代码块 + Telegram 推送（F6）+ 可选自动键入（code 版 Alt+1/Alt+2）。
 - **公式排版**：行内公式使用 `$...$`，关键公式和推导步骤使用独立 `$$...$$` 块；窗口会区分行内公式与公式块，原始 Markdown 保留供复制。
 - **Prompt 场景**：任意时刻只启用一个技术场景（通用 / AI Infra / 前端 / 自定义），语音回答与截图回答同步切换；点击答案窗右上角的场景名称可编辑。
-- **code 笔记专区**：悬浮窗顶部通过「回答 / 笔记」按钮切换；笔记页递归读取 `notes/` 下的 Markdown，只在本地展示，不发送给模型。
+- **code 标签页**：悬浮窗顶部通过「回答 / 笔记 / 朋友」按钮切换；笔记页递归读取 `notes/` 下的 Markdown，只在本地展示，不发送给模型；朋友页显示互助回复，可拖选复制，代码块等宽渲染。
 - 防捕获常驻开启：共享屏幕/录屏时答案窗从捕获画面消失，不提供关闭热键。
+- **局域网互助（朋友远程看题/回答案）**：本机启动一个房间级 HTTP 中继，朋友用手机
+  浏览器打开 `http://<本机局域网IP>:8787/?t=<房间token>` 即可看到问题和你主动发的
+  截图，并在每道题下回复答案。code 版的回复进入顶部「👤 朋友」标签页，与
+  「回答 / 笔记」并列，不混入 AI 答案区；quiz 版没有标签栏，保留底部独立面板。
+  朋友页正文可直接拖选，代码块以等宽字体高亮，选中后按「复制选中」/右键菜单/`Alt+4`
+  只复制选中的代码；`Alt+4` 没有选区时复制最近一条回复。手机和电脑需在同一 Wi-Fi；
+  远程可用 Tailscale/ZeroTier 组网后打开同一链接。默认开启，`HELPER_LAN=false`
+  关闭。截图通过「📸 截图」按钮或 `Alt+7` 触发（窗口会先离场再抓屏，避免把答案
+  截进去）。
 
 ## 会话数据
 
@@ -86,8 +96,13 @@ Alt+P     截屏识图（同题可续截，自动带多轮记忆）
 Alt+1     答案就位后自动打字（再按停止）
 Alt+2     剪贴板粘贴整段答案
 Alt+3     换新题：清空识图记忆和当前答案显示（历史仍可回看）
-F4        隐藏/显示答案窗（也可点击右上角“—”隐藏）
+F4        最小化到系统 / 再按出现（窗口藏了时按 F4 直接出现；隐藏用右上角“—”）
 F6        Telegram 手机推送开关
+F7        局域网互助开关（朋友浏览器链接）
+Alt+7     截图发给朋友（互助开启时）
+Alt+4     复制朋友回复（有拖选时只复制选中片段，否则最近一条）
+Alt+5     把最近一条朋友回复打进当前焦点框
+Alt+6     复制互助链接
 F9        按住解除门控
 ↑ / ↓     回答页翻历史；笔记页切换上一篇 / 下一篇
 Ctrl+Esc  紧急暂停     ESC×2 或 Ctrl+Q  退出
@@ -95,18 +110,18 @@ Ctrl+Esc  紧急暂停     ESC×2 或 Ctrl+Q  退出
 
 ### 自定义快捷键
 
-全部键盘操作都可以在 `.env` 中重绑。比如把不合适的 `F4` 显隐窗口改成 `F7`：
+全部键盘操作都可以在 `.env` 中重绑。比如把不合适的 `F4` 最小化/出现改成 `F7`：
 
 ```dotenv
 HOTKEY_TOGGLE_WINDOW=F7
 ```
 
-支持单键（`F7`）、组合键（`Ctrl+Shift+H`）、多个可选键（`F3|P`）；设为
+支持单键（`F7`）、组合键（`Ctrl+Shift+H`）、多个可选键（`Alt+F3|Alt+P`）；设为
 `none` 可禁用某项。通用配置同时作用于 quiz/code；加 `QUIZ_` 或 `CODE_` 前缀可只覆盖
 某个入口，场景专用配置优先级更高：
 
 ```dotenv
-QUIZ_HOTKEY_VISION=F3|P
+QUIZ_HOTKEY_VISION=Ctrl+P
 CODE_HOTKEY_VISION=Ctrl+Shift+P
 CODE_HOTKEY_TOGGLE_WINDOW=F7
 ```
@@ -125,6 +140,8 @@ CODE_HOTKEY_TOGGLE_WINDOW=F7
 - `ANSWER_THINKING` — 问答模型思考开关，支持 `enabled` / `disabled`；留空使用模型默认值
 - `SAVE_SCREENSHOTS` / `SAVE_AUDIO` / `SAVE_TRANSCRIPTS` — 本地会话数据开关，默认开启
 - `BOT_TOKEN` / `ALLOWED_IDS` / `PROXY` — Telegram 推送
+- `HELPER_LAN` / `HELPER_LAN_PORT` / `HELPER_LAN_BIND` / `HELPER_ROOM_TOKEN` — 局域网互助中继
+- `HELPER_SEND_SHOT` — 是否允许把本机截图推给浏览器端朋友（默认开）
 - `ISI_APPKEY` / `ALIYUN_AK_ID` / `ALIYUN_AK_SECRET` / `DASHSCOPE_API_KEY` — 转写/备用 ASR（可选）
 
 `.env` 已在 `.gitignore`，不入库。真实 key 私下分发，勿提交进仓库。
@@ -171,8 +188,8 @@ python run_code.py --manual
 
 手动模式操作流程：
 
-1. 按 `F1`（默认，可通过 `.env` 修改）开始录音。
-2. 等面试官说完问题后按 `F2`（默认，可通过 `.env` 修改）。
+1. 按 `Alt+F1`（默认，可通过 `.env` 修改）开始录音。
+2. 等面试官说完问题后按 `Alt+F2`（默认，可通过 `.env` 修改）。
 3. 程序停止本轮录音，将音频提交云端转写；转写文本上屏后，自动调用问答模型生成答案。
 
 手动模式默认同时启动电脑回环和麦克风，因此既能收电脑播放的面试官声音，也能直接用麦克风讲话测试；默认按 `F10` 可在“全听”和“只听电脑输出”之间切换。

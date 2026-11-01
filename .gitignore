@@ -1,4 +1,5 @@
 .env
+.env.bak-*
 resume.md
 __pycache__/
 logs/
@@ -7,5 +8,12 @@ logs/
 *.png
 window-pos.txt
 prompt-scenes.json
+appearance.json
+*.log
 session-*.jsonl
 interview_tool/assets/fonts/*.ttf
+helper-link.json
+helper-link.jsonl
+helper-inbox.jsonl
+helper-link.lock
+helper-shots/

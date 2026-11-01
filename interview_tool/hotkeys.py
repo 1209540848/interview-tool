@@ -52,14 +52,19 @@ for _i in range(10):
     _KEY_CODES[f"Num{_i}"] = 0x60 + _i
 
 _ACTION_SPECS = {
-    "record_start": ("HOTKEY_RECORD_START", "F1"),
-    "record_stop": ("HOTKEY_RECORD_STOP", "F2"),
-    "vision": ("HOTKEY_VISION", {"quiz": "F3|P", "code": "Alt+P"}),
+    "record_start": ("HOTKEY_RECORD_START", "Alt+F1"),
+    "record_stop": ("HOTKEY_RECORD_STOP", "Alt+F2"),
+    "vision": ("HOTKEY_VISION", {"quiz": "Alt+F3|Alt+P", "code": "Alt+P"}),
     "type_answer": ("HOTKEY_TYPE_ANSWER", {"quiz": "1", "code": "Alt+1"}),
     "paste_answer": ("HOTKEY_PASTE_ANSWER", "Alt+2"),
     "clear_vision": ("HOTKEY_CLEAR_VISION", "Alt+3"),
     "toggle_window": ("HOTKEY_TOGGLE_WINDOW", "F4"),
     "toggle_push": ("HOTKEY_TOGGLE_PUSH", "F6"),
+    "helper_toggle": ("HOTKEY_HELPER_TOGGLE", "F7"),
+    "helper_copy": ("HOTKEY_HELPER_COPY", "Alt+4"),
+    "helper_type": ("HOTKEY_HELPER_TYPE", "Alt+5"),
+    "helper_link": ("HOTKEY_HELPER_LINK", "Alt+6"),
+    "helper_shot": ("HOTKEY_HELPER_SHOT", "Alt+7"),
     "toggle_prompter": ("HOTKEY_TOGGLE_PROMPTER", "F8"),
     "force_mic": ("HOTKEY_FORCE_MIC", "F9"),
     "toggle_mode": ("HOTKEY_TOGGLE_MODE", "F10"),
@@ -230,7 +235,7 @@ class HotkeyBindings:
             time.sleep(0.02)
         time.sleep(0.05)
 
-    def banner(self, manual):
+    def banner(self, manual, helper=False):
         if manual:
             prefix = (f"✅ 就绪（手动模式）。{self.label('record_start')} 开始录音，"
                       f"{self.label('record_stop')} 结束并生成答案。")
@@ -246,7 +251,7 @@ class HotkeyBindings:
             items += [f"{self.label('paste_answer')} 粘贴",
                       f"{self.label('clear_vision')} 清题"]
         items += [
-            f"{self.label('toggle_window')} 显隐窗口",
+            f"{self.label('toggle_window')} 最小化/出现",
             f"{self.label('toggle_push')} 推送",
             f"{self.label('toggle_prompter')} 提词器",
             (f"{self.label('toggle_mode')} "
@@ -256,6 +261,12 @@ class HotkeyBindings:
         ]
         if not manual:
             items.append(f"{self.label('force_mic')} 按住强制收音")
+        if helper:
+            items.append(f"{self.label('helper_toggle')} 互助开关")
+            items.append(f"{self.label('helper_shot')} 截图给朋友")
+            items.append(f"{self.label('helper_copy')} / "
+                         f"{self.label('helper_type')} 朋友答复复制/输入")
+            items.append(f"{self.label('helper_link')} 互助链接")
         exit_label = self.label("exit")
         if self.profile_key == "code":
             exit_label += " 双按"
@@ -268,7 +279,8 @@ class HotkeyRuntime:
                  state, state_lock, epoch, recorder_loop, recorder_mic,
                  event_q, attach_on, prompt_store, type_answer,
                  paste_answer, do_vision, reset_vision, save_geometry,
-                 manual_handler, shutdown_event=None):
+                 manual_handler, shutdown_event=None,
+                 helper=None, helper_type_answer=None):
         self.bindings = bindings
         self.profile_key = profile_key
         self.manual = manual
@@ -289,6 +301,8 @@ class HotkeyRuntime:
         self.reset_vision = reset_vision
         self.save_geometry = save_geometry
         self.manual_handler = manual_handler
+        self.helper = helper
+        self.helper_type_answer = helper_type_answer
         self.shutdown_event = shutdown_event or threading.Event()
         self.hidden = False
         self.exit_previous = 0.0
@@ -306,7 +320,9 @@ class HotkeyRuntime:
     def _exit(self, reason, message):
         log_event({"type": "session_end", "reason": reason})
         if self.root is not None:
-            self.save_geometry(self.root.geometry())
+            geom_for_save = getattr(self.root, "_geom_for_save", None)
+            self.save_geometry(geom_for_save() if callable(geom_for_save)
+                               else self.root.geometry())
         print(message, flush=True)
         self.shutdown_event.set()
         if self.root is not None:
@@ -449,15 +465,26 @@ class HotkeyRuntime:
                     self.ui("status", "🧹 本就无识图记忆")
 
             if keys["toggle_window"].pressed and self.root is not None:
-                self.hidden = not bool(getattr(self.root, "_user_hidden", self.hidden))
-                self.root._user_hidden = self.hidden
-                if self.hidden:
-                    self.root.withdraw()
-                    print(f"🙈 窗口已隐藏（再按 {self.bindings.label('toggle_window')} 显示）",
-                          flush=True)
-                else:
-                    self.root.deiconify()
-                    print("👁️ 窗口已显示", flush=True)
+                # F4 = 系统最小化/出现；窗口藏着时先恢复显示。
+                # 一律经 ui 队列回主线程执行（Tk 非线程安全，热键线程不直接动窗口）
+                self.ui("mini_toggle")
+
+            # 局域网互助：窗口/剪贴板操作全部投主线程，只有「输入朋友答案」
+            # 需要阻塞逐字注入，走 _after_release 后台线程（同 Alt+1）。
+            if self.helper is not None:
+                if keys["helper_toggle"].pressed:
+                    self.ui("helper_toggle")
+                if keys["helper_copy"].pressed:
+                    self.ui("helper_copy")
+                if keys["helper_link"].pressed:
+                    self.ui("helper_link")
+                if keys["helper_shot"].pressed:
+                    self.ui("helper_shot")
+                if keys["helper_type"].pressed and self.helper_type_answer:
+                    threading.Thread(target=self._after_release,
+                                     args=("helper_type",
+                                           self.helper_type_answer),
+                                     daemon=True).start()
 
             if keys["history_prev"].pressed:
                 self.ui("nav", -1)
